@@ -12,14 +12,24 @@ You pick the mode in the NetworkManager applet: connect your original profile fo
 the "(split)" copy that vpnks creates for split tunnelling.
 
 ## Build & install
+Prerequisites are qt6, ninja and cmake:
+```
+pacman -S qt6-base qt6-wayland cmake ninja
+```
+To compile
+```
+mkdir build
+cd build
+cmake ..
+make
+```
+optionally, can install system wide with `sudo make install` or otherwise.
 
-    pacman -S qt6-base qt6-wayland cmake ninja
-    cmake -B build -G Ninja -DVPNKS_USER=<your login>
-    cmake --build build
-    sudo cmake --install build
-
-Run the configure step as yourself, not in a root shell. `VPNKS_USER` goes into the polkit rule
-(it defaults to `$USER` at configure time).
+The install step creates the system group `vpnks` (`groupadd -r vpnks`); the polkit rule grants
+passwordless use to its members. Add your user to it and log out and back in or run `newgrp`:
+```
+sudo usermod -aG vpnks $USER
+```
 
 | Installed file | Purpose |
 |---|---|
@@ -29,7 +39,7 @@ Run the configure step as yourself, not in a root shell. `VPNKS_USER` goes into 
 | `/etc/vpnks/helper.conf` | names, host-only link addresses, fallback DNS, per-app method, cgroup mark/table |
 | `/usr/lib/systemd/system/vpnks.slice` | persistent slice for the cgroup methods (enabled on first switch to one) |
 | `/usr/share/polkit-1/actions/org.vpnks.helper.policy` | pkexec action for the helper |
-| `/etc/polkit-1/rules.d/50-vpnks.rules` | no password prompts for `VPNKS_USER` (helper, firewalld, and pkexec of iptables/ip6tables/nft/ufw — delete that last block if you only use firewalld) |
+| `/etc/polkit-1/rules.d/50-vpnks.rules` | no password prompts for members of group `vpnks` (helper, firewalld, and pkexec of iptables/ip6tables/nft/ufw — delete that last block if you only use firewalld) |
 
 ## Per-app VPN
 
