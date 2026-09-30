@@ -40,6 +40,7 @@ package() {
     # pacman's sysusers hook creates the group from this on install
     install -Dm644 "${srcdir}/${_pkgname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
-    echo "Authentication is performed via polkit:"
+
+    echo "NOTE: Authentication is performed via polkit:"
     echo "==> Add your user to the vpnks group: usermod -aG vpnks \$USER"
 }
