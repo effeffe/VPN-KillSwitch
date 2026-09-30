@@ -1,7 +1,7 @@
 # Maintainer: Filippo Falezza <fraro43@gmail.com>
 pkgname=vpnks-git
 _pkgname=vpnks
-pkgver=r5.0b1ec20
+pkgver=r6.d3a8ff7
 pkgrel=1
 pkgdesc="VPN killswitch and per-app VPN (split tunnel) for NetworkManager (Qt6)"
 arch=('x86_64' 'aarch64')
@@ -27,6 +27,7 @@ pkgver() {
 
 build() {
     cd ${srcdir}/${_pkgname}
+    rm -Rf build
     mkdir build
     cd build
     cmake ..
@@ -34,9 +35,10 @@ build() {
 }
 
 package() {
+    cd ${srcdir}/${_pkgname}/build
     DESTDIR=${pkgdir} make install
     # pacman's sysusers hook creates the group from this on install
-    install -Dm644 "${_pkgname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 "${srcdir}/${_pkgname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
     echo "Authentication is performed via polkit:"
     echo "==> Add your user to the vpnks group: usermod -aG vpnks \$USER"
