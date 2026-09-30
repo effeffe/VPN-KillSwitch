@@ -1,9 +1,0 @@
-/usr/local/bin/vpnks
-/usr/local/share/applications/vpnks.desktop
-/usr/local/share/icons/hicolor/scalable/apps/vpnks.svg
-/usr/lib/vpnks/vpnks-helper
-/etc/NetworkManager/dispatcher.d/90-vpnks
-/etc/vpnks/helper.conf
-/usr/lib/systemd/system/vpnks.slice
-/usr/share/polkit-1/actions/org.vpnks.helper.policy
-/etc/polkit-1/rules.d/50-vpnks.rules

@@ -1,9 +1,0 @@
-/home/claude/vpnks/build/CMakeFiles/vpnks.dir
-/home/claude/vpnks/build/CMakeFiles/edit_cache.dir
-/home/claude/vpnks/build/CMakeFiles/rebuild_cache.dir
-/home/claude/vpnks/build/CMakeFiles/list_install_components.dir
-/home/claude/vpnks/build/CMakeFiles/install.dir
-/home/claude/vpnks/build/CMakeFiles/install/local.dir
-/home/claude/vpnks/build/CMakeFiles/install/strip.dir
-/home/claude/vpnks/build/CMakeFiles/vpnks_autogen_timestamp_deps.dir
-/home/claude/vpnks/build/CMakeFiles/vpnks_autogen.dir
