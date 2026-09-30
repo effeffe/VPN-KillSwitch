@@ -1,0 +1,43 @@
+# Maintainer: Filippo Falezza <fraro43@gmail.com>
+pkgname=vpnks-git
+_pkgname=vpnks
+pkgver=r5.0b1ec20
+pkgrel=1
+pkgdesc="VPN killswitch and per-app VPN (split tunnel) for NetworkManager (Qt6)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/effeffe/VPN-KillSwitch"
+license=('GPL-3.0-only')
+depends=('qt6-base' 'networkmanager' 'polkit' 'iproute2' 'systemd' 'bash')
+makedepends=('git' 'cmake' 'ninja')
+optdepends=('qt6-wayland: Wayland support'
+            'firewalld: killswitch backend'
+            'nftables: killswitch backend'
+            'iptables: killswitch backend'
+            'ufw: killswitch backend')
+provides=("${_pkgname}")
+conflicts=("${_pkgname}")
+backup=('etc/vpnks/helper.conf')
+source=("$_pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$_pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd ${srcdir}/${_pkgname}
+    mkdir build
+    cd build
+    cmake ..
+    make
+}
+
+package() {
+    DESTDIR=${pkgdir} make install
+    # pacman's sysusers hook creates the group from this on install
+    install -Dm644 "${_pkgname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    echo "Authentication is performed via polkit:"
+    echo "==> Add your user to the vpnks group: usermod -aG vpnks \$USER"
+}
