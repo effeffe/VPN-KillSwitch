@@ -1,0 +1,7 @@
+#!/bin/sh
+# NetworkManager dispatcher hook for vpnks. When the split-tunnel VPN profile
+# (connection.interface-name = TUNNEL from /etc/vpnks/helper.conf) goes up or down,
+# the helper moves its XFRM interface into / removes it from the vpnks namespace.
+# Every other event and interface is ignored by the helper.
+[ -x /usr/lib/vpnks/vpnks-helper ] || exit 0
+exec /usr/lib/vpnks/vpnks-helper dispatch "$@"

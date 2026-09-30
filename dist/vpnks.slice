@@ -1,0 +1,13 @@
+# vpnks: apps started with a cgroup per-app method run in scopes below this slice.
+# The firewall rules match it by cgroup path. The kernel resolves that path once,
+# when a rule is inserted, so the slice has to exist before the rules load (it is
+# started with slices.target, before firewalld) and must not be recreated while
+# rules point at it (hence RefuseManualStop / IgnoreOnIsolate).
+[Unit]
+Description=vpnks per-app VPN (cgroup methods)
+Before=slices.target
+RefuseManualStop=yes
+IgnoreOnIsolate=yes
+
+[Install]
+WantedBy=slices.target

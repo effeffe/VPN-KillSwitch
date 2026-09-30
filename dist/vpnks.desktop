@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=VPN killswitch
+Comment=Full-tunnel killswitch and per-app VPN namespace for NetworkManager VPNs
+Exec=vpnks --hidden
+Icon=vpnks
+StartupWMClass=vpnks
+Terminal=false
+Categories=Network;Settings;

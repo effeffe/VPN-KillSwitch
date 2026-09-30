@@ -1,0 +1,608 @@
+#!/bin/bash
+# vpnks-helper - root side of the vpnks per-app VPN namespace ("split tunnel").
+#
+# The split-tunnel VPN profile names its XFRM interface $TUNNEL (connection.interface-name).
+# On vpn-up the NetworkManager dispatcher hook calls "dispatch", which moves that interface
+# into the network namespace $NS. charon-nm and the IPsec SAs stay in the root namespace;
+# only the plaintext side of the tunnel moves, so processes in $NS can reach the outside
+# world through the tunnel and nothing else. A host-only veth pair ($HOST_IF <-> $NS_IF)
+# lets this machine reach services inside (e.g. a web UI); nothing is routed beyond it.
+#
+# Per-app method (MODE, switched with "set-mode"):
+#   netns              apps run inside $NS (default)
+#   cgroup-split       apps run in the system slice $SLICE, in the root namespace; firewall
+#                      rules (installed by vpnks) mark their packets, and while the split
+#                      tunnel is attached policy routing sends marked traffic through the
+#                      host-only link to $NS, which forwards it into the tunnel with NAT
+#   cgroup-killswitch  apps run in $SLICE; the firewall rules only let them out through the
+#                      full tunnel (use with the normal, full-tunnel profile)
+#
+# Usage (as root: via pkexec from the vpnks GUI, or from the NetworkManager dispatcher):
+#   vpnks-helper setup | teardown [--force] | attach | detach | status | stop-apps
+#   vpnks-helper set-mode netns|cgroup-split|cgroup-killswitch [--force]
+#   vpnks-helper dispatch IFACE ACTION
+#   vpnks-helper exec APP_ID [--env KEY=VALUE]... -- COMMAND     (through pkexec only)
+set -euo pipefail
+umask 022
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+SELF=/usr/lib/vpnks/vpnks-helper
+CONF=/etc/vpnks/helper.conf
+STATE_DIR=/run/vpnks
+STATE_FILE=$STATE_DIR/state
+
+# ---- defaults, overridable in $CONF -----------------------------------------
+NS=vpnks
+TUNNEL=vpnks0
+HOST_IF=vpnks-h
+NS_IF=vpnks-ns
+HOST_ADDR=10.99.0.1/30
+NS_ADDR=10.99.0.2/30
+FALLBACK_DNS="1.1.1.1 9.9.9.9"
+PLACEHOLDER=yes
+TUNNEL_KINDS=xfrm
+MODE=netns
+SLICE=vpnks.slice
+CGROUP_MARK=0x766b
+CGROUP_TABLE=211
+
+# Session variables a launched app may inherit (plus LC_*). Keep Namespace::sessionEnvArgs() in sync.
+ALLOWED_ENV=" DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
+XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_CURRENT_DESKTOP DESKTOP_SESSION KDE_FULL_SESSION \
+KDE_SESSION_VERSION QT_QPA_PLATFORM QT_QPA_PLATFORMTHEME QT_SCALE_FACTOR QT_AUTO_SCREEN_SCALE_FACTOR \
+GDK_BACKEND GDK_SCALE GTK_THEME XCURSOR_THEME XCURSOR_SIZE MOZ_ENABLE_WAYLAND LANG LANGUAGE TZ \
+PATH TERM COLORTERM XDG_DATA_DIRS XDG_CONFIG_DIRS XDG_DATA_HOME XDG_CONFIG_HOME XDG_CACHE_HOME \
+XDG_STATE_HOME PULSE_SERVER PIPEWIRE_RUNTIME_DIR "
+
+log() { logger -t vpnks-helper -- "$*" 2>/dev/null || true; printf 'vpnks-helper: %s\n' "$*" >&2; }
+die() { log "error: $*"; exit 1; }
+
+is_name() { [[ $1 =~ ^[A-Za-z0-9_-]{1,15}$ ]]; }
+is_ip4()  { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_cidr() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; }
+
+load_conf() {
+    [ -e "$CONF" ] || return 0
+    [ "$(stat -c %u "$CONF")" = 0 ] || die "$CONF must be owned by root"
+    local mode
+    mode=$(stat -c %a "$CONF")
+    if (( (8#$mode & 8#022) != 0 )); then die "$CONF must not be group- or world-writable"; fi
+    local line key val n
+    # plain KEY=VALUE parsing - the file is data, never sourced
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}
+        [[ $line =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        key=${BASH_REMATCH[1]}
+        val=${BASH_REMATCH[2]}
+        val=${val%"${val##*[![:space:]]}"}
+        val=${val#\"}; val=${val%\"}
+        case $key in
+            NS|TUNNEL|HOST_IF|NS_IF|HOST_ADDR|NS_ADDR|FALLBACK_DNS|PLACEHOLDER|TUNNEL_KINDS|MODE|SLICE|CGROUP_MARK|CGROUP_TABLE)
+                printf -v "$key" '%s' "$val" ;;
+        esac
+    done < "$CONF"
+    for n in "$NS" "$TUNNEL" "$HOST_IF" "$NS_IF"; do
+        is_name "$n" || die "invalid name '$n' in $CONF"
+    done
+    if ! is_cidr "$HOST_ADDR" || ! is_cidr "$NS_ADDR"; then die "HOST_ADDR and NS_ADDR must be IPv4/prefix"; fi
+    case $PLACEHOLDER in yes|no) ;; *) die "PLACEHOLDER must be yes or no" ;; esac
+    [[ $TUNNEL_KINDS =~ ^[a-z0-9[:space:]]+$ ]] || die "invalid TUNNEL_KINDS"
+    for n in $FALLBACK_DNS; do is_ip4 "$n" || die "invalid FALLBACK_DNS entry '$n'"; done
+    case $MODE in netns|cgroup-split|cgroup-killswitch) ;; *) die "MODE must be netns, cgroup-split or cgroup-killswitch" ;; esac
+    [[ $SLICE =~ ^[A-Za-z0-9_-]{1,64}\.slice$ ]] || die "SLICE must be a top-level slice name like vpnks.slice"
+    CGROUP_MARK=${CGROUP_MARK,,}
+    [[ $CGROUP_MARK =~ ^0x[1-9a-f][0-9a-f]{0,7}$ ]] || die "CGROUP_MARK must be hex without leading zeros, e.g. 0x766b"
+    [[ $CGROUP_TABLE =~ ^[1-9][0-9]{0,8}$ ]] || die "CGROUP_TABLE must be a number"
+    case $CGROUP_TABLE in 210|253|254|255) die "CGROUP_TABLE $CGROUP_TABLE is reserved (210 is charon-nm's)" ;; esac
+}
+
+set_conf() {   # KEY VALUE (validated by the caller)
+    mkdir -p "${CONF%/*}"
+    if [ -e "$CONF" ] && grep -qE "^[[:space:]]*$1[[:space:]]*=" "$CONF"; then
+        sed -i -E "s|^[[:space:]]*$1[[:space:]]*=.*|$1=$2|" "$CONF"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$CONF"
+    fi
+    chown root:root "$CONF"
+    chmod 0644 "$CONF"
+}
+
+take_lock() {
+    mkdir -p "$STATE_DIR"
+    exec 9>"$STATE_DIR/lock"
+    flock -w 30 9 || die "timed out waiting for $STATE_DIR/lock"
+}
+
+ns_exists() { [ -e "/run/netns/$NS" ]; }
+ns_has()    { ns_exists && ip -n "$NS" link show dev "$1" >/dev/null 2>&1; }
+
+# link_kind [NETNS] DEV -> rtnetlink kind (xfrm, dummy, veth, tun, ...); empty if absent
+link_kind() {
+    local json
+    if [ $# -eq 2 ]; then
+        json=$(ip -n "$1" -d -j link show dev "$2" 2>/dev/null) || return 0
+    else
+        json=$(ip -d -j link show dev "$1" 2>/dev/null) || return 0
+    fi
+    { grep -oE '"info_kind":"[^"]*"' <<<"$json" | head -n1 | cut -d'"' -f4; } || true
+}
+
+kind_allowed() {
+    local k
+    for k in $TUNNEL_KINDS; do
+        if [ "$1" = "$k" ]; then return 0; fi
+    done
+    return 1
+}
+
+env_vip() {    # "10.13.63.10/32 0.0.0.0" -> 10.13.63.10/32
+    local a=${VPN_IP4_ADDRESS_0:-}
+    a=${a%% *}
+    if is_cidr "$a" || is_ip4 "$a"; then printf '%s\n' "$a"; fi
+}
+
+env_dns() {
+    local s out=""
+    for s in ${VPN_IP4_NAMESERVERS:-}; do
+        if is_ip4 "$s"; then out+="${out:+ }$s"; fi
+    done
+    printf '%s\n' "$out"
+}
+
+tunnel_vip() { # [NETNS] -> first global IPv4 address/prefix on $TUNNEL
+    if [ $# -eq 1 ]; then
+        ip -n "$1" -4 -o addr show dev "$TUNNEL" scope global 2>/dev/null | awk '{print $4; exit}'
+    else
+        ip -4 -o addr show dev "$TUNNEL" scope global 2>/dev/null | awk '{print $4; exit}'
+    fi
+}
+
+write_state() {   # KEY=VALUE... merged over the previous state; tunnel status is always live
+    mkdir -p "$STATE_DIR"
+    local -A st=()
+    local k v kv tmp
+    if [ -r "$STATE_FILE" ]; then
+        while IFS='=' read -r k v; do
+            if [[ $k =~ ^[a-z_]+$ ]]; then st[$k]=$v; fi
+        done < "$STATE_FILE"
+    fi
+    for kv in "$@"; do
+        k=${kv%%=*}; v=${kv#*=}
+        st[$k]=${v//$'\n'/ }
+    done
+    st[ns]=$NS
+    st[tunnel_if]=$TUNNEL
+    st[host_addr]=${HOST_ADDR%/*}
+    st[ns_addr]=${NS_ADDR%/*}
+    if ns_exists; then st[ns_present]=yes; else st[ns_present]=no; fi
+    if ns_has "$TUNNEL"; then
+        st[tunnel]=attached
+    else
+        st[tunnel]=detached; st[vip]=""; st[dns]=""; st[connection]=""; st[connection_id]=""
+    fi
+    st[mode]=$MODE
+    st[slice]=$SLICE
+    if rule_present 100; then st[cgroup_routing]=up; else st[cgroup_routing]=down; fi
+    st[updated]=$(date +%s)
+    tmp=$(mktemp "$STATE_DIR/.state.XXXXXX")
+    for k in "${!st[@]}"; do printf '%s=%s\n' "$k" "${st[$k]}"; done | sort > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+}
+
+write_resolv() {  # "server server ..."
+    local dir=/etc/netns/$NS s tmp
+    mkdir -p "$dir"
+    tmp=$(mktemp "$dir/.resolv.XXXXXX")
+    {
+        echo "# written by vpnks-helper: resolvers for the $NS namespace (queried through the tunnel)"
+        for s in $1; do
+            if is_ip4 "$s"; then echo "nameserver $s"; fi
+        done
+        echo "options edns0"
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$dir/resolv.conf"
+}
+
+ensure_ns() {
+    if ! ns_exists; then
+        ip netns add "$NS"
+        log "created network namespace $NS"
+    fi
+    ip -n "$NS" link set lo up
+    # Only IPv4 is routed into the tunnel; with IPv6 off nothing inside tries it first.
+    ip netns exec "$NS" sysctl -q -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+}
+
+ensure_host_link() {
+    if ! ip link show dev "$HOST_IF" >/dev/null 2>&1; then
+        ip -n "$NS" link del "$NS_IF" >/dev/null 2>&1 || true
+        ip link add "$HOST_IF" type veth peer name "$NS_IF" netns "$NS"
+        log "created host-only link $HOST_IF <-> $NS:$NS_IF"
+    fi
+    ip addr replace "$HOST_ADDR" dev "$HOST_IF"
+    # never forward anything that arrives from the namespace
+    sysctl -q -w "net.ipv4.conf.$HOST_IF.forwarding=0" >/dev/null 2>&1 || true
+    sysctl -q -w "net.ipv6.conf.$HOST_IF.disable_ipv6=1" >/dev/null 2>&1 || true
+    ip link set dev "$HOST_IF" up
+    ip -n "$NS" addr replace "$NS_ADDR" dev "$NS_IF"
+    ip -n "$NS" link set dev "$NS_IF" up
+}
+
+ensure_ns_files() {   # consumed by `ip netns exec`, which bind-mounts them over /etc
+    local dir=/etc/netns/$NS tmp
+    mkdir -p "$dir"
+    tmp=$(mktemp "$dir/.nsswitch.XXXXXX")
+    # same as the host, except names resolve with plain DNS via resolv.conf instead of
+    # the host's systemd-resolved (which would send queries outside the tunnel)
+    if [ -r /etc/nsswitch.conf ]; then
+        sed -E '/^[[:space:]]*hosts:/d' /etc/nsswitch.conf > "$tmp"
+    else
+        : > "$tmp"
+    fi
+    echo 'hosts: files myhostname dns' >> "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$dir/nsswitch.conf"
+    if [ ! -e "$dir/resolv.conf" ]; then write_resolv "$FALLBACK_DNS"; fi
+}
+
+# ---- cgroup method -----------------------------------------------------------
+in_slice() { grep -q "^0::/$SLICE/" /proc/self/cgroup 2>/dev/null; }
+
+ensure_slice() {
+    # Firewall rules match the slice's cgroup by path; the kernel resolves the path when a
+    # rule is inserted and keeps that cgroup. So the slice must exist before the rules load
+    # (enabled -> active before firewalld at boot) and keep its identity (RefuseManualStop).
+    if ! systemctl is-active --quiet "$SLICE"; then
+        systemctl start "$SLICE" || die "cannot start $SLICE - is /usr/lib/systemd/system/$SLICE installed?"
+    fi
+    systemctl is-enabled --quiet "$SLICE" 2>/dev/null || systemctl enable --quiet "$SLICE" || log "warning: could not enable $SLICE"
+    [ -d "/sys/fs/cgroup/$SLICE" ] || die "$SLICE is active but /sys/fs/cgroup/$SLICE is missing (cgroup v2 required)"
+}
+
+slice_pids() {
+    [ -d "/sys/fs/cgroup/$SLICE" ] || return 0
+    find "/sys/fs/cgroup/$SLICE" -name cgroup.procs -exec cat {} + 2>/dev/null | tr '\n' ' ' | sed 's/ *$//'
+}
+
+terminate() {   # FUNCTION-LISTING-PIDS: TERM, wait up to 5 s, then KILL
+    local pids i
+    pids=$("$1")
+    [ -n "$pids" ] || return 0
+    log "stopping processes: $pids"
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.5
+        [ -n "$("$1")" ] || return 0
+        : "$i"
+    done
+    pids=$("$1")
+    # shellcheck disable=SC2086
+    if [ -n "$pids" ]; then kill -KILL $pids 2>/dev/null || true; fi
+}
+
+rule_present() { ip rule show pref "$1" 2>/dev/null | grep -q "fwmark $CGROUP_MARK"; }
+
+ns_router() {   # up|down - forwarding + NAT inside $NS for host traffic routed in by mark
+    if command -v nft >/dev/null 2>&1; then
+        if [ "$1" = up ]; then
+            ip netns exec "$NS" nft -f - <<EOF
+table ip vpnks_router
+delete table ip vpnks_router
+table ip vpnks_router {
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        iifname "$NS_IF" oifname "$TUNNEL" tcp flags syn tcp option maxseg size set rt mtu
+        iifname "$NS_IF" oifname "$TUNNEL" accept
+        iifname "$TUNNEL" oifname "$NS_IF" ct state established,related accept
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "$TUNNEL" masquerade
+    }
+}
+EOF
+        else
+            ip netns exec "$NS" nft delete table ip vpnks_router >/dev/null 2>&1 || true
+        fi
+    elif command -v iptables >/dev/null 2>&1; then
+        local ipt=(ip netns exec "$NS" iptables -w)
+        "${ipt[@]}" -F FORWARD 2>/dev/null || true
+        "${ipt[@]}" -t mangle -F FORWARD 2>/dev/null || true
+        "${ipt[@]}" -t nat -F POSTROUTING 2>/dev/null || true
+        if [ "$1" = up ]; then
+            "${ipt[@]}" -P FORWARD DROP
+            "${ipt[@]}" -t mangle -A FORWARD -i "$NS_IF" -o "$TUNNEL" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+            "${ipt[@]}" -A FORWARD -i "$NS_IF" -o "$TUNNEL" -j ACCEPT
+            "${ipt[@]}" -A FORWARD -i "$TUNNEL" -o "$NS_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            "${ipt[@]}" -t nat -A POSTROUTING -o "$TUNNEL" -j MASQUERADE
+        fi
+    elif [ "$1" = up ]; then
+        die "cgroup split mode needs nft or iptables for the NAT inside the namespace"
+    fi
+}
+
+cgroup_routing_up() {
+    # marked traffic keeps LAN / link routes (main without its default route), everything
+    # else goes to the namespace, which forwards it into the tunnel
+    ip route replace default via "${NS_ADDR%/*}" dev "$HOST_IF" table "$CGROUP_TABLE"
+    rule_present 99  || ip rule add pref 99 fwmark "$CGROUP_MARK" lookup main suppress_prefixlength 0
+    rule_present 100 || ip rule add pref 100 fwmark "$CGROUP_MARK" lookup "$CGROUP_TABLE"
+    # replies come back on the host link from internet addresses: loose reverse-path check
+    sysctl -q -w "net.ipv4.conf.$HOST_IF.rp_filter=2" >/dev/null 2>&1 || true
+    ip netns exec "$NS" sysctl -q -w net.ipv4.ip_forward=1 >/dev/null
+    ns_router up
+    log "cgroup split: traffic marked $CGROUP_MARK from $SLICE is routed through $NS into $TUNNEL"
+}
+
+cgroup_routing_down() {
+    while ip rule del pref 99 fwmark "$CGROUP_MARK" 2>/dev/null; do :; done
+    while ip rule del pref 100 fwmark "$CGROUP_MARK" 2>/dev/null; do :; done
+    ip route flush table "$CGROUP_TABLE" >/dev/null 2>&1 || true
+    if ns_exists; then
+        ip netns exec "$NS" sysctl -q -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+        ns_router down
+    fi
+}
+
+apply_mode() {
+    if [ "$MODE" = cgroup-split ] && ns_has "$TUNNEL"; then cgroup_routing_up; else cgroup_routing_down; fi
+}
+
+cmd_attach() {
+    ensure_ns
+    ensure_host_link
+    ensure_ns_files
+    local kind vip="" dns
+    kind=$(link_kind "$TUNNEL")
+    if [ -n "$kind" ] && kind_allowed "$kind"; then
+        # the live tunnel is still in the root namespace: read its address, then move it
+        vip=$(tunnel_vip)
+        [ -n "$vip" ] || vip=$(env_vip)
+        ip -n "$NS" link del dev "$TUNNEL" >/dev/null 2>&1 || true    # stale copy of an old session
+        ip link set dev "$TUNNEL" netns "$NS"
+        log "moved $TUNNEL ($kind) into namespace $NS"
+        if [ "$PLACEHOLDER" = yes ]; then
+            # NetworkManager re-resolves the tunnel by name whenever charon-nm re-sends its IP
+            # config (after an IKE re-establishment) and fails the VPN if the name is gone.
+            if ip link add "$TUNNEL" type dummy 2>/dev/null; then
+                log "left a dummy $TUNNEL in the root namespace as a placeholder for NetworkManager"
+            else
+                log "warning: could not create the placeholder dummy; after an IKE re-establishment NetworkManager will drop the VPN"
+            fi
+        fi
+    elif [ "$kind" = dummy ]; then
+        # our placeholder: config re-sent after a re-establishment, the tunnel is already inside
+        vip=$(env_vip)
+        log "$TUNNEL already in namespace $NS; refreshing its configuration"
+    elif [ -n "$kind" ]; then
+        die "$TUNNEL is a '$kind' device, expected: $TUNNEL_KINDS. (charon-nm falls back to a TUN device when it cannot create the XFRM interface, e.g. because a device with that name was left behind; disconnect, run 'vpnks-helper detach', reconnect.)"
+    fi
+    ns_has "$TUNNEL" || die "no $TUNNEL interface - is the split profile connected, and does it set connection.interface-name=$TUNNEL?"
+    [ -n "$vip" ] || vip=$(tunnel_vip "$NS")
+    [ -n "$vip" ] || die "could not determine the VPN's virtual IP"
+    case $vip in */*) ;; *) vip=$vip/32 ;; esac
+    is_cidr "$vip" || die "unexpected virtual IP '$vip'"
+    # moving a device flushes its addresses and routes, so configure it from scratch
+    ip -n "$NS" addr flush dev "$TUNNEL"
+    ip -n "$NS" addr add "$vip" dev "$TUNNEL"
+    ip -n "$NS" link set dev "$TUNNEL" up
+    ip -n "$NS" route replace default dev "$TUNNEL" src "${vip%/*}"
+    dns=$(env_dns)
+    [ -n "$dns" ] || dns=$FALLBACK_DNS
+    write_resolv "$dns"
+    apply_mode
+    write_state vip="${vip%/*}" dns="$dns" connection="${CONNECTION_UUID:-}" connection_id="${CONNECTION_ID:-}"
+    log "namespace $NS: default route via $TUNNEL, source ${vip%/*}, DNS $dns"
+}
+
+cmd_detach() {
+    if [ "$(link_kind "$TUNNEL")" = dummy ]; then
+        ip link del dev "$TUNNEL" 2>/dev/null || true
+    fi
+    if ns_has "$TUNNEL"; then
+        # without SAs it would drop everything anyway; removing it fails apps fast (no route)
+        ip -n "$NS" link del dev "$TUNNEL" 2>/dev/null || true
+        log "removed $TUNNEL from namespace $NS; apps there are offline until the VPN reconnects"
+    fi
+    apply_mode
+    write_state
+}
+
+cmd_setup() {
+    ensure_ns
+    ensure_host_link
+    ensure_ns_files
+    if kind_allowed "$(link_kind "$TUNNEL")"; then
+        log "the split VPN is already connected; attaching $TUNNEL"
+        cmd_attach
+        return
+    fi
+    write_state
+    log "namespace $NS ready (host-only link ${HOST_ADDR%/*} <-> ${NS_ADDR%/*})"
+}
+
+ns_pids() { ip netns pids "$NS" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//'; }
+
+cmd_teardown() {
+    local force=${1:-}
+    if ns_exists; then
+        if [ -n "$(ns_pids)" ]; then
+            [ "$force" = --force ] || die "processes still running in namespace $NS: $(ns_pids) (use --force to stop them)"
+            terminate ns_pids
+        fi
+        if ns_has "$TUNNEL"; then
+            log "warning: the split VPN stays connected in NetworkManager but loses its interface; disconnect it"
+        fi
+    fi
+    cgroup_routing_down
+    if [ "$(link_kind "$TUNNEL")" = dummy ]; then ip link del dev "$TUNNEL" 2>/dev/null || true; fi
+    ip link del dev "$HOST_IF" 2>/dev/null || true
+    ip netns del "$NS" 2>/dev/null || true
+    rm -rf "/etc/netns/${NS:?}"
+    write_state
+    log "namespace $NS removed"
+}
+
+cmd_set_mode() {
+    local new=${1:-} force=${2:-}
+    case $new in netns|cgroup-split|cgroup-killswitch) ;; *) die "usage: set-mode netns|cgroup-split|cgroup-killswitch [--force]" ;; esac
+    if [ "$new" != "$MODE" ] && [ "$MODE" != netns ] && [ -n "$(slice_pids)" ]; then
+        # the firewall rules that confine these apps are about to change or disappear
+        [ "$force" = --force ] || die "apps are still running in $SLICE: $(slice_pids) (quit them or use --force)"
+        terminate slice_pids
+    fi
+    # prepare first, so a failure leaves the configured mode unchanged
+    if [ "$new" != netns ]; then ensure_slice; fi
+    if [ "$new" = cgroup-split ]; then ensure_ns; ensure_host_link; ensure_ns_files; fi
+    set_conf MODE "$new"
+    MODE=$new
+    apply_mode
+    write_state
+    log "per-app method is now $MODE"
+}
+
+cmd_stop_apps() {
+    terminate slice_pids
+    if ns_exists; then terminate ns_pids; fi
+}
+
+cmd_exec() {
+    local uid=${PKEXEC_UID:-}
+    [[ $uid =~ ^[0-9]+$ ]] || die "exec must be run through pkexec"
+    [ "$uid" -ne 0 ] || die "refusing to launch applications as root"
+    local app=${1:-}
+    shift || true
+    [[ $app =~ ^[a-z0-9_]{1,64}$ ]] || die "invalid application id '$app'"
+    local orig=("$@")
+    local pw name gid home shell
+    pw=$(getent passwd "$uid") || die "unknown uid $uid"
+    IFS=: read -r name _ _ gid _ home shell <<<"$pw"
+    [ -d "$home" ] || home=/
+
+    local envs=() kv key
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --env)
+                [ $# -ge 2 ] || die "--env needs KEY=VALUE"
+                kv=$2
+                shift 2
+                key=${kv%%=*}
+                if [[ $kv == *=* && $kv != *$'\n'* ]] && { [[ $ALLOWED_ENV == *" $key "* ]] || [[ $key =~ ^LC_[A-Z_]+$ ]]; }; then
+                    envs+=("$kv")
+                else
+                    log "ignoring environment entry '${key:0:40}'"
+                fi ;;
+            --) shift; break ;;
+            *) die "unexpected argument '$1'" ;;
+        esac
+    done
+    if [ $# -ne 1 ] || [ -z "$1" ]; then die "expected exactly one command string after --"; fi
+
+    local cmd=$1
+    local priv=(setpriv --reuid="$uid" --regid="$gid" --init-groups --no-new-privs --inh-caps=-all --bounding-set=-all --)
+    local envline=(env -i -C "$home" PATH=/usr/local/bin:/usr/bin:/bin HOME="$home" USER="$name" LOGNAME="$name"
+                   SHELL="$shell" "${envs[@]}" VPNKS_APP="$app")
+
+    if [ "$MODE" = netns ]; then
+        take_lock
+        ensure_ns
+        ensure_host_link
+        ensure_ns_files
+        exec 9>&-   # release the lock; the app must not inherit it
+        log "launching '$app' for uid $uid in namespace $NS"
+        # `ip netns exec` enters the namespace and bind-mounts /etc/netns/$NS/* over /etc.
+        # setpriv then drops to the caller for good: real/effective/saved IDs, supplementary
+        # groups, no capabilities (not even via file caps or setuid binaries: empty bounding
+        # set + no_new_privs), so the app cannot re-route itself or leave the namespace.
+        exec ip netns exec "$NS" "${priv[@]}" "${envline[@]}" VPNKS_NS="$NS" /bin/sh -c "$cmd"
+    fi
+
+    # cgroup methods, stage 1: start a scope in $SLICE (system manager) and re-run ourselves in it
+    if [ "${VPNKS_STAGE:-}" != 2 ]; then
+        take_lock
+        ensure_slice
+        if [ "$MODE" = cgroup-split ]; then ensure_ns_files; fi
+        exec 9>&-
+        local pre=()
+        # split: a private mount namespace so the app resolves through the tunnel (see stage 2)
+        if [ "$MODE" = cgroup-split ]; then pre=(unshare --mount --propagation slave --); fi
+        log "launching '$app' for uid $uid in $SLICE ($MODE)"
+        export VPNKS_STAGE=2
+        VPNKS_PARENT_MNT=$(readlink /proc/self/ns/mnt)
+        export VPNKS_PARENT_MNT
+        exec systemd-run --quiet --collect --scope --slice="$SLICE" \
+            --unit="vpnks-$app-$(date +%s%N)-$$" --description="vpnks: $app" -- \
+            "${pre[@]}" "$SELF" exec "$app" "${orig[@]}"
+    fi
+
+    # stage 2: never start the app unconfined
+    in_slice || die "not running inside $SLICE - refusing to start '$app' unconfined"
+    if [ "$MODE" = cgroup-split ]; then
+        # the host's resolver would query outside the tunnel; bind the namespace's files over
+        # /etc - only ever inside our own mount namespace
+        # stage 1 recorded its mount namespace; unshare must have given us a different one
+        if [ -z "${VPNKS_PARENT_MNT:-}" ] || [ "$(readlink /proc/self/ns/mnt)" = "$VPNKS_PARENT_MNT" ]; then
+            die "no private mount namespace - refusing to touch /etc"
+        fi
+        mount --bind "/etc/netns/$NS/resolv.conf" /etc/resolv.conf || die "cannot bind resolv.conf"
+        mount --bind "/etc/netns/$NS/nsswitch.conf" /etc/nsswitch.conf || die "cannot bind nsswitch.conf"
+    fi
+    exec "${priv[@]}" "${envline[@]}" VPNKS_SLICE="$SLICE" /bin/sh -c "$cmd"
+}
+
+yesno() { if "$@"; then echo yes; else echo no; fi; }
+
+cmd_status() {
+    echo "per-app method: $MODE"
+    echo "namespace $NS present: $(yesno ns_exists)"
+    echo "root-namespace $TUNNEL kind: $(link_kind "$TUNNEL")"
+    if ns_exists; then
+        echo "--- interfaces in $NS"; ip -n "$NS" -br addr
+        echo "--- routes in $NS";     ip -n "$NS" route
+        echo "--- processes in $NS"
+        local p
+        for p in $(ns_pids); do ps -o pid=,user=,args= -p "$p" 2>/dev/null || true; done
+        echo "--- /etc/netns/$NS/resolv.conf"; cat "/etc/netns/$NS/resolv.conf" 2>/dev/null || true
+    fi
+    if [ "$MODE" != netns ]; then
+        echo "--- $SLICE: $(systemctl is-active "$SLICE" 2>/dev/null || true), processes: $(slice_pids)"
+        echo "--- policy routing (fwmark $CGROUP_MARK)"; ip rule show | grep -F "fwmark $CGROUP_MARK" || echo "(none)"
+        ip route show table "$CGROUP_TABLE" 2>/dev/null || true
+    fi
+    if [ -r "$STATE_FILE" ]; then echo "--- $STATE_FILE"; cat "$STATE_FILE"; fi
+}
+
+cmd_dispatch() {
+    local iface=${1:-} action=${2:-}
+    [ "$iface" = "$TUNNEL" ] || return 0
+    case $action in
+        vpn-up)   cmd_attach ;;
+        vpn-down) cmd_detach ;;
+    esac
+}
+
+main() {
+    [ "$(id -u)" = 0 ] || die "must run as root (through pkexec or the NetworkManager dispatcher)"
+    load_conf
+    local cmd=${1:-}
+    shift || true
+    case $cmd in
+        exec)     cmd_exec "$@" ;;
+        dispatch) take_lock; cmd_dispatch "$@" ;;
+        attach)   take_lock; cmd_attach ;;
+        detach)   take_lock; cmd_detach ;;
+        setup)    take_lock; cmd_setup ;;
+        teardown) take_lock; cmd_teardown "$@" ;;
+        set-mode) take_lock; cmd_set_mode "$@" ;;
+        stop-apps) cmd_stop_apps ;;
+        status)   cmd_status ;;
+        *) echo "usage: vpnks-helper {setup | teardown [--force] | attach | detach | status | stop-apps | set-mode netns|cgroup-split|cgroup-killswitch [--force] | dispatch IFACE ACTION | exec APP_ID [--env K=V]... -- COMMAND}" >&2
+           exit 2 ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
