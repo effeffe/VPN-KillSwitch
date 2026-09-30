@@ -15,7 +15,7 @@ std::unique_ptr<Backend> Backend::create(const Runner &r, const GlobalConfig &c)
 
 QString Backend::findAppsTag(const QString &text)
 {
-    static const QRegularExpression re(QStringLiteral("vpnks:apps:[0-9a-f]+"));
+    static const QRegularExpression re(QStringLiteral("vpnks:apps:[0-9a-f]+(-[0-9a-f]+)?"));
     const auto m = re.match(text);
     return m.hasMatch() ? m.captured(0) : QString();
 }

@@ -16,7 +16,8 @@ public:
 private:
     QList<QStringList> globalRules(const QStringList &eps, const QStringList &up) const;
     QList<QStringList> appRules(const AppRuleSpec &s) const;
-    bool add(const QList<QStringList> &rules, QString *err) const;
+    // makes the runtime and permanent rules containing `tag` exactly `rules`, without a gap
+    bool sync(const QList<QStringList> &rules, const QString &tag, QString *err) const;
     bool removeWhere(const std::function<bool(const QString &)> &match, QString *err) const;
     bool removeTagged(const QString &tag, QString *err) const
     { return removeWhere([&tag](const QString &l) { return l.contains(tag); }, err); }

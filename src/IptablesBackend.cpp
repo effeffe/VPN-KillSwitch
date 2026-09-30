@@ -10,17 +10,6 @@ static const QString OUTPUT = QStringLiteral("OUTPUT"), POSTROUTING = QStringLit
 static const QStringList BINS{QStringLiteral("iptables"), QStringLiteral("ip6tables")};
 static QStringList tagged(const QString &t) { return {QStringLiteral("-m"), QStringLiteral("comment"), QStringLiteral("--comment"), t}; }
 
-bool IptablesBackend::ensureChain(const QString &bin, const QString &table, const QString &hook, const QString &chain, QString *err) const
-{
-    const QStringList t{QStringLiteral("-t"), table};
-    ipt(bin, t + QStringList{QStringLiteral("-N"), chain}); // may already exist
-    if (!ipt(bin, t + QStringList{QStringLiteral("-C"), hook, QStringLiteral("-j"), chain}).ok()) {
-        const CmdResult r = ipt(bin, t + QStringList{QStringLiteral("-I"), hook, QStringLiteral("1"), QStringLiteral("-j"), chain});
-        if (!r.ok()) { if (err) *err = r.err; return false; }
-    }
-    return true;
-}
-
 bool IptablesBackend::dropChain(const QString &bin, const QString &table, const QString &hook, const QString &chain) const
 {
     const QStringList t{QStringLiteral("-t"), table};
@@ -29,13 +18,34 @@ bool IptablesBackend::dropChain(const QString &bin, const QString &table, const 
     return ipt(bin, t + QStringList{QStringLiteral("-X"), chain}).ok();
 }
 
+bool IptablesBackend::replaceChain(const QString &bin, const QString &table, const QString &hook, const QString &chain,
+                                   const QList<QStringList> &body, QString *err) const
+{
+    // fill a new chain, jump to it, then drop the old one and take its name: never a moment without rules
+    const QStringList t{QStringLiteral("-t"), table};
+    const QString fresh = chain + QStringLiteral("_NEW");
+    dropChain(bin, table, hook, fresh);   // leftover of an interrupted run
+    const CmdResult n = ipt(bin, t + QStringList{QStringLiteral("-N"), fresh});
+    if (!n.ok()) { if (err) *err = n.err; return false; }
+    for (const QStringList &r : body) {
+        const CmdResult c = ipt(bin, t + QStringList{QStringLiteral("-A"), fresh} + r);
+        if (!c.ok()) { if (err) *err = c.err; dropChain(bin, table, hook, fresh); return false; }
+    }
+    const CmdResult j = ipt(bin, t + QStringList{QStringLiteral("-I"), hook, QStringLiteral("1"), QStringLiteral("-j"), fresh});
+    if (!j.ok()) { if (err) *err = j.err; dropChain(bin, table, hook, fresh); return false; }
+    dropChain(bin, table, hook, chain);
+    const CmdResult e = ipt(bin, t + QStringList{QStringLiteral("-E"), fresh, chain});
+    if (!e.ok()) { if (err) *err = e.err; return false; }
+    return true;
+}
+
 QList<QStringList> IptablesBackend::globalBody(const QString &bin, const QStringList &eps, const QStringList &up) const
 {
     const bool v4 = bin == BINS[0];
     const QString T = QString::fromLatin1(kGlobalTag);
     const QString A = QStringLiteral("ACCEPT");
     QList<QStringList> R;
-    auto add = [&](QStringList b) { R << (QStringList{QStringLiteral("-A"), G} + b + tagged(T)); };
+    auto add = [&](QStringList b) { R << (b + tagged(T)); };
     add({QStringLiteral("-o"), QStringLiteral("lo"), QStringLiteral("-j"), A});
     if (v4) {
         add({QStringLiteral("-m"), QStringLiteral("addrtype"), QStringLiteral("--dst-type"), QStringLiteral("LOCAL"), QStringLiteral("-j"), A});
@@ -62,10 +72,7 @@ bool IptablesBackend::arm(const QStringList &eps, const QStringList &up, QString
     bool ok = true;
     for (const QString &bin : BINS) {
         dropChain(bin, FILTER, OUTPUT, LEGACY_APPS);
-        ipt(bin, {QStringLiteral("-N"), G});
-        ipt(bin, {QStringLiteral("-F"), G});
-        for (const QStringList &r : globalBody(bin, eps, up)) { const CmdResult c = ipt(bin, r); if (!c.ok()) { ok = false; if (err) *err = c.err; } }
-        ok = ensureChain(bin, FILTER, OUTPUT, G, err) && ok;
+        ok = replaceChain(bin, FILTER, OUTPUT, G, globalBody(bin, eps, up), err) && ok;
     }
     return ok;
 }
@@ -86,37 +93,35 @@ bool IptablesBackend::isArmed()
 
 bool IptablesBackend::applyAppRules(const AppRuleSpec &s, QString *err)
 {
-    removeAppRules(nullptr);
     bool ok = true;
     const QString A = QStringLiteral("ACCEPT");
     const QStringList M{QStringLiteral("-m"), QStringLiteral("cgroup"), QStringLiteral("--path"), s.cgroupPath};
-    auto run = [&](const QString &bin, const QStringList &a) { const CmdResult c = ipt(bin, a); if (!c.ok()) { ok = false; if (err) *err = c.err; } };
+    if (!s.split) { dropChain(BINS[0], MANGLE, OUTPUT, CGM); dropChain(BINS[0], NAT, POSTROUTING, CGN); }
     for (const QString &bin : BINS) {
         const bool v4 = bin == BINS[0];
-        ipt(bin, {QStringLiteral("-N"), CG});
-        auto add = [&](QStringList b) { run(bin, QStringList{QStringLiteral("-A"), CG} + M + b + tagged(s.tag)); };
+        QList<QStringList> body;
+        auto add = [&](QStringList b) { body << (M + b + tagged(s.tag)); };
         add({QStringLiteral("-o"), QStringLiteral("lo"), QStringLiteral("-j"), A});
         if (v4) {
             add({QStringLiteral("-m"), QStringLiteral("addrtype"), QStringLiteral("--dst-type"), QStringLiteral("LOCAL"), QStringLiteral("-j"), A});
             for (const QString &l : m_c.allowedCidrs()) add({QStringLiteral("-d"), l, QStringLiteral("-j"), A});
+            for (const QString &e : s.endpoints) {
+                if (s.uplinks.isEmpty()) add({QStringLiteral("-d"), e, QStringLiteral("-j"), A});
+                for (const QString &u : s.uplinks) add({QStringLiteral("-o"), u, QStringLiteral("-d"), e, QStringLiteral("-j"), A});
+            }
             add({QStringLiteral("-o"), m_c.tunnelIpt(), QStringLiteral("-j"), A});
             if (s.split) add({QStringLiteral("-o"), s.hostIf, QStringLiteral("-j"), A});
         } else if (!m_c.blockIpv6) {
             add({QStringLiteral("-o"), m_c.tunnelIpt(), QStringLiteral("-j"), A});
         }
         add({QStringLiteral("-j"), QStringLiteral("REJECT")});
-        ok = ensureChain(bin, FILTER, OUTPUT, CG, err) && ok;
+        ok = replaceChain(bin, FILTER, OUTPUT, CG, body, err) && ok;
     }
     if (s.split) {
         const QString &b4 = BINS[0];
-        ipt(b4, {QStringLiteral("-t"), MANGLE, QStringLiteral("-N"), CGM});
-        run(b4, QStringList{QStringLiteral("-t"), MANGLE, QStringLiteral("-A"), CGM} + M
-                + QStringList{QStringLiteral("-j"), QStringLiteral("MARK"), QStringLiteral("--set-mark"), s.mark} + tagged(s.tag));
-        ok = ensureChain(b4, MANGLE, OUTPUT, CGM, err) && ok;
-        ipt(b4, {QStringLiteral("-t"), NAT, QStringLiteral("-N"), CGN});
-        run(b4, QStringList{QStringLiteral("-t"), NAT, QStringLiteral("-A"), CGN, QStringLiteral("-o"), s.hostIf, QStringLiteral("-m"), QStringLiteral("mark"),
-                            QStringLiteral("--mark"), s.mark, QStringLiteral("-j"), QStringLiteral("MASQUERADE")} + tagged(s.tag));
-        ok = ensureChain(b4, NAT, POSTROUTING, CGN, err) && ok;
+        ok = replaceChain(b4, MANGLE, OUTPUT, CGM, {M + QStringList{QStringLiteral("-j"), QStringLiteral("MARK"), QStringLiteral("--set-mark"), s.mark} + tagged(s.tag)}, err) && ok;
+        ok = replaceChain(b4, NAT, POSTROUTING, CGN, {QStringList{QStringLiteral("-o"), s.hostIf, QStringLiteral("-m"), QStringLiteral("mark"),
+                              QStringLiteral("--mark"), s.mark, QStringLiteral("-j"), QStringLiteral("MASQUERADE")} + tagged(s.tag)}, err) && ok;
     }
     return ok;
 }

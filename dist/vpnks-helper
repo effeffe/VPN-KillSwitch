@@ -18,9 +18,10 @@
 #                      full tunnel (use with the normal, full-tunnel profile)
 #
 # Usage (as root: via pkexec from the vpnks GUI, or from the NetworkManager dispatcher):
-#   vpnks-helper setup | teardown [--force] | attach | detach | status | stop-apps
+#   vpnks-helper setup | teardown [--force] | attach | detach | status | peers | stop-apps
 #   vpnks-helper set-mode netns|cgroup-split|cgroup-killswitch [--force]
 #   vpnks-helper dispatch IFACE ACTION
+#   vpnks-helper wg-import NAME < CONFIG | wg-import-nm UUID NAME | wg-remove NAME | wg-up NAME | wg-down
 #   vpnks-helper exec APP_ID [--env KEY=VALUE]... -- COMMAND     (through pkexec only)
 set -euo pipefail
 umask 022
@@ -178,8 +179,9 @@ write_state() {   # KEY=VALUE... merged over the previous state; tunnel status i
     if ns_exists; then st[ns_present]=yes; else st[ns_present]=no; fi
     if ns_has "$TUNNEL"; then
         st[tunnel]=attached
+        st[tunnel_type]=$(link_kind "$NS" "$TUNNEL")
     else
-        st[tunnel]=detached; st[vip]=""; st[dns]=""; st[connection]=""; st[connection_id]=""
+        st[tunnel]=detached; st[tunnel_type]=""; st[vip]=""; st[dns]=""; st[connection]=""; st[connection_id]=""
     fi
     st[mode]=$MODE
     st[slice]=$SLICE
@@ -362,6 +364,7 @@ cmd_attach() {
         # the live tunnel is still in the root namespace: read its address, then move it
         vip=$(tunnel_vip)
         [ -n "$vip" ] || vip=$(env_vip)
+        if [ "$(link_kind "$NS" "$TUNNEL")" = wireguard ]; then log "replacing the WireGuard tunnel in $NS with the split profile's"; fi
         ip -n "$NS" link del dev "$TUNNEL" >/dev/null 2>&1 || true    # stale copy of an old session
         ip link set dev "$TUNNEL" netns "$NS"
         log "moved $TUNNEL ($kind) into namespace $NS"
@@ -403,7 +406,7 @@ cmd_detach() {
     if [ "$(link_kind "$TUNNEL")" = dummy ]; then
         ip link del dev "$TUNNEL" 2>/dev/null || true
     fi
-    if ns_has "$TUNNEL"; then
+    if ns_has "$TUNNEL" && [ "$(link_kind "$NS" "$TUNNEL")" != wireguard ]; then
         # without SAs it would drop everything anyway; removing it fails apps fast (no route)
         ip -n "$NS" link del dev "$TUNNEL" 2>/dev/null || true
         log "removed $TUNNEL from namespace $NS; apps there are offline until the VPN reconnects"
@@ -434,7 +437,7 @@ cmd_teardown() {
             [ "$force" = --force ] || die "processes still running in namespace $NS: $(ns_pids) (use --force to stop them)"
             terminate ns_pids
         fi
-        if ns_has "$TUNNEL"; then
+        if ns_has "$TUNNEL" && [ "$(link_kind "$NS" "$TUNNEL")" != wireguard ]; then
             log "warning: the split VPN stays connected in NetworkManager but loses its interface; disconnect it"
         fi
     fi
@@ -554,6 +557,243 @@ cmd_exec() {
     exec "${priv[@]}" "${envline[@]}" VPNKS_SLICE="$SLICE" /bin/sh -c "$cmd"
 }
 
+# ---- WireGuard split tunnel (managed here, not by NetworkManager) --------------
+# Profiles live in $WG_DIR/NAME.conf (root, 0600), stored in wg-quick syntax but only with the
+# keys below: wg-quick hooks (PostUp & co.) are dropped on import and never run. wg-up creates
+# the interface in the root namespace - its UDP socket stays there and reaches the server over
+# the normal connection - then moves it into $NS, like the XFRM interface of a split profile.
+WG_DIR=/etc/vpnks/wg
+
+is_wg_name() { [[ $1 =~ ^[A-Za-z0-9_-]{1,32}$ ]]; }
+is_wg_key()  { [[ $1 =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$ ]]; }
+is_ip6ish()  { [[ $1 == *:* && $1 =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; }
+
+wg_list_ok() {   # "a, b,c" CHECK... -> "a, b, c" if every item passes one of the checks
+    local item out="" c ok
+    local -a items
+    IFS=, read -ra items <<<"$1"
+    shift
+    for item in "${items[@]}"; do
+        item=${item//[[:space:]]/}
+        [ -n "$item" ] || continue
+        ok=1
+        for c in "$@"; do if "$c" "$item"; then ok=0; break; fi; done
+        [ $ok = 0 ] || return 1
+        out+="${out:+, }$item"
+    done
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+}
+is_dns_item() { is_ip4 "$1" || is_ip6ish "$1" || [[ $1 =~ ^[A-Za-z0-9._-]{1,253}$ ]]; }
+
+wg_normalize() {   # wg-quick config on stdin -> validated config with only the keys vpnks uses
+    local line sect="" key val n=0 peers=0 priv=0 addr=0 pub=1
+    local -a out=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        (( ++n <= 2000 )) || die "WireGuard config too long"
+        line=${line%%#*}; line=${line//$'\r'/}
+        line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+        [ -n "$line" ] || continue
+        if [[ $line =~ ^\[(Interface|Peer)\]$ ]]; then
+            [ $pub = 1 ] || die "a [Peer] section has no PublicKey"
+            sect=${BASH_REMATCH[1]}
+            out+=("" "[$sect]")
+            if [ "$sect" = Peer ]; then peers=$((peers + 1)); pub=0; fi
+            continue
+        fi
+        [[ $line =~ ^([A-Za-z]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || die "cannot parse WireGuard config line '${line:0:60}'"
+        key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[2]}
+        case $sect/$key in
+            Interface/PrivateKey)   is_wg_key "$val" || die "invalid PrivateKey"; priv=1 ;;
+            Interface/ListenPort)   [[ $val =~ ^[0-9]{1,5}$ ]] && (( val <= 65535 )) || die "invalid ListenPort" ;;
+            Interface/Address)      val=$(wg_list_ok "$val" is_cidr is_ip4 is_ip6ish) || die "invalid Address '$val'"; addr=1 ;;
+            Interface/DNS)          val=$(wg_list_ok "$val" is_dns_item) || die "invalid DNS '$val'" ;;
+            Interface/MTU)          [[ $val =~ ^[0-9]{3,5}$ ]] && (( val >= 1280 && val <= 9000 )) || die "invalid MTU" ;;
+            Interface/Table|Interface/FwMark|Interface/SaveConfig|Interface/PreUp|Interface/PostUp|Interface/PreDown|Interface/PostDown)
+                log "WireGuard import: ignoring $key (not used by vpnks)"; continue ;;
+            Peer/PublicKey)         is_wg_key "$val" || die "invalid PublicKey"; pub=1 ;;
+            Peer/PresharedKey)      is_wg_key "$val" || die "invalid PresharedKey" ;;
+            Peer/Endpoint)          [[ $val =~ ^([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}$ ]] || die "invalid Endpoint '$val'" ;;
+            Peer/AllowedIPs)        val=$(wg_list_ok "$val" is_cidr is_ip4 is_ip6ish) || die "invalid AllowedIPs '$val'" ;;
+            Peer/PersistentKeepalive) [[ $val =~ ^([0-9]{1,5}|off)$ ]] || die "invalid PersistentKeepalive" ;;
+            *) die "unsupported WireGuard setting '$key' in [${sect:-no section}]" ;;
+        esac
+        out+=("$key = $val")
+    done
+    [ $pub = 1 ] || die "a [Peer] section has no PublicKey"
+    [ $priv = 1 ] || die "the WireGuard config has no PrivateKey"
+    [ $addr = 1 ] || die "the WireGuard config has no Address"
+    [ $peers -ge 1 ] || die "the WireGuard config has no [Peer]"
+    printf '%s\n' "${out[@]:1}"
+}
+
+wg_iface_value() {   # KEY < normalized config -> value from [Interface]
+    awk -v k="$1" '/^\[/ { s = $0; next } s == "[Interface]" && index($0, k " = ") == 1 { print substr($0, length(k) + 4); exit }'
+}
+
+wg_setconf_text() {  # normalized config on stdin -> input for `wg setconf`, endpoints resolved to IPs
+    local line host port ip
+    while IFS= read -r line; do
+        case $line in
+            "Address = "*|"DNS = "*|"MTU = "*) continue ;;
+            "Endpoint = "*)
+                host=${line#Endpoint = }; port=${host##*:}; host=${host%:*}
+                if [[ $host != \[* ]] && ! is_ip4 "$host"; then
+                    # resolved here: inside $NS there is no route to a resolver until the tunnel is up
+                    ip=$(getent ahostsv4 "$host" | awk 'NR == 1 { print $1 }')
+                    is_ip4 "$ip" || die "cannot resolve WireGuard endpoint $host"
+                    host=$ip
+                fi
+                line="Endpoint = $host:$port" ;;
+        esac
+        printf '%s\n' "$line"
+    done
+}
+
+wg_store() {   # NAME < normalized config
+    local tmp
+    mkdir -p "$WG_DIR"
+    chown root:root "$WG_DIR"; chmod 0755 "$WG_DIR"   # names are listed by the GUI, contents are root-only
+    tmp=$(mktemp "$WG_DIR/.import.XXXXXX")
+    chmod 0600 "$tmp"
+    cat > "$tmp"
+    mv -f "$tmp" "$WG_DIR/$1.conf"
+    log "stored WireGuard profile '$1' in $WG_DIR/$1.conf"
+}
+
+cmd_wg_import() {   # NAME, wg-quick config on stdin
+    local name=${1:-} norm
+    is_wg_name "$name" || die "invalid profile name '$name' (letters, digits, _ and -, at most 32)"
+    norm=$(head -c 65536 | wg_normalize) || exit 1
+    wg_store "$name" <<<"$norm"
+}
+
+nm_keyfile() {   # UUID -> path of the NetworkManager keyfile holding that connection
+    local f
+    for f in /etc/NetworkManager/system-connections/* /run/NetworkManager/system-connections/*; do
+        [ -f "$f" ] || continue
+        if grep -qxF "uuid=$1" "$f"; then printf '%s\n' "$f"; return 0; fi
+    done
+    return 1
+}
+
+cmd_wg_import_nm() {   # UUID NAME: convert a NetworkManager WireGuard connection
+    local uuid=${1:-} name=${2:-} file conf norm
+    [[ $uuid =~ ^[0-9a-fA-F-]{36}$ ]] || die "invalid connection UUID '$uuid'"
+    is_wg_name "$name" || die "invalid profile name '$name' (letters, digits, _ and -, at most 32)"
+    file=$(nm_keyfile "$uuid") || die "no NetworkManager keyfile for connection $uuid"
+    conf=$(awk '
+        function add(list, v) { return list == "" ? v : list ", " v }
+        /^\[/ { sect = substr($0, 2, length($0) - 2)
+                if (sect ~ /^wireguard-peer\./) { np++; pubkey[np] = substr(sect, 16) }
+                next }
+        { i = index($0, "="); if (!i) next; k = substr($0, 1, i - 1); v = substr($0, i + 1) }
+        sect == "connection" && k == "type" { type = v }
+        sect == "wireguard" && k == "private-key" { priv = v }
+        sect == "wireguard" && k == "listen-port" { port = v }
+        sect == "wireguard" && k == "mtu" { mtu = v }
+        sect ~ /^wireguard-peer\./ { peer[np, k] = v }
+        (sect == "ipv4" || sect == "ipv6") && k ~ /^address[0-9]+$/ { split(v, a, ","); addr = add(addr, a[1]) }
+        (sect == "ipv4" || sect == "ipv6") && k == "dns" {
+            n = split(v, d, ";"); for (j = 1; j <= n; j++) if (d[j] != "") dns = add(dns, d[j]) }
+        END {
+            if (type != "wireguard") exit 3
+            if (priv == "") exit 4
+            print "[Interface]"; print "PrivateKey = " priv
+            if (port != "" && port != "0") print "ListenPort = " port
+            if (addr != "") print "Address = " addr
+            if (dns != "") print "DNS = " dns
+            if (mtu != "" && mtu != "0") print "MTU = " mtu
+            for (p = 1; p <= np; p++) {
+                print ""; print "[Peer]"; print "PublicKey = " pubkey[p]
+                if (peer[p, "preshared-key"] != "") print "PresharedKey = " peer[p, "preshared-key"]
+                if (peer[p, "endpoint"] != "") print "Endpoint = " peer[p, "endpoint"]
+                ips = peer[p, "allowed-ips"]; gsub(/;/, ", ", ips); sub(/, $/, "", ips)
+                if (ips != "") print "AllowedIPs = " ips
+                ka = peer[p, "persistent-keepalive"]
+                if (ka != "" && ka != "0") print "PersistentKeepalive = " ka
+            }
+        }' "$file") || case $? in
+            3) die "connection $uuid is not a WireGuard connection" ;;
+            4) die "connection $uuid does not store its private key (it is kept by a secret agent); import a .conf file instead" ;;
+            *) die "could not read $file" ;;
+        esac
+    norm=$(wg_normalize <<<"$conf") || exit 1
+    wg_store "$name" <<<"$norm"
+}
+
+cmd_wg_remove() {
+    local name=${1:-}
+    is_wg_name "$name" || die "invalid profile name '$name'"
+    rm -f "$WG_DIR/$name.conf"
+    log "removed WireGuard profile '$name'"
+}
+
+cmd_wg_up() {
+    local name=${1:-} conf norm wgconf addrs dns="" mtu a vip=""
+    is_wg_name "$name" || die "invalid profile name '$name'"
+    conf=$WG_DIR/$name.conf
+    [ -f "$conf" ] || die "no WireGuard profile '$name'"
+    command -v wg >/dev/null 2>&1 || die "the wg tool is missing - install wireguard-tools"
+    if ns_has "$TUNNEL"; then die "a tunnel ($(link_kind "$NS" "$TUNNEL")) is already attached to $NS; disconnect it first"; fi
+    [ -z "$(link_kind "$TUNNEL")" ] || die "$TUNNEL exists in the root namespace (is a split profile connected?); disconnect it first"
+    norm=$(wg_normalize < "$conf") || exit 1
+    wgconf=$(wg_setconf_text <<<"$norm") || exit 1
+    addrs=$(wg_iface_value Address <<<"$norm")
+    mtu=$(wg_iface_value MTU <<<"$norm")
+    for a in ${addrs//,/ }; do
+        if is_cidr "$a" || is_ip4 "$a"; then vip=$a; break; fi
+    done
+    [ -n "$vip" ] || die "profile '$name' has no IPv4 Address (only IPv4 is routed in the namespace)"
+    case $vip in */*) ;; *) vip=$vip/32 ;; esac
+    for a in $(wg_iface_value DNS <<<"$norm" | tr ',' ' '); do
+        if is_ip4 "$a"; then dns+="${dns:+ }$a"; fi
+    done
+    [ -n "$dns" ] || dns=$FALLBACK_DNS
+
+    ensure_ns
+    ensure_host_link
+    ensure_ns_files
+    ip link add "$TUNNEL" type wireguard || die "cannot create WireGuard interface $TUNNEL (is the wireguard module available?)"
+    ip link set dev "$TUNNEL" netns "$NS"
+    if ! ip netns exec "$NS" wg setconf "$TUNNEL" /dev/stdin <<<"$wgconf"; then
+        ip -n "$NS" link del dev "$TUNNEL" 2>/dev/null || true
+        die "wg setconf failed for profile '$name'"
+    fi
+    ip -n "$NS" addr add "$vip" dev "$TUNNEL"
+    ip -n "$NS" link set dev "$TUNNEL" mtu "${mtu:-1420}" up
+    ip -n "$NS" route replace default dev "$TUNNEL" src "${vip%/*}"
+    write_resolv "$dns"
+    apply_mode
+    write_state vip="${vip%/*}" dns="$dns" connection="wireguard:$name" connection_id="$name (WireGuard)"
+    log "namespace $NS: WireGuard '$name' up, default route via $TUNNEL, source ${vip%/*}, DNS $dns"
+}
+
+cmd_wg_down() {
+    if [ "$(link_kind "$NS" "$TUNNEL")" = wireguard ]; then
+        ip -n "$NS" link del dev "$TUNNEL" 2>/dev/null || true
+        log "WireGuard tunnel removed from $NS; apps there are offline until a tunnel is attached"
+    fi
+    apply_mode
+    write_state
+}
+
+# Remote IPv4 addresses of the live IPsec SAs and WireGuard peers in the root namespace, one per
+# line. The killswitch rules let traffic to them out on the uplink: the encrypted packets of an
+# IPsec tunnel still carry the socket (and so the cgroup) of the app that sent the plaintext.
+cmd_peers() {
+    local locals a
+    locals=" $(ip -o -4 addr show | awk '{ sub(/\/.*/, "", $4); print $4 }' | tr '\n' ' ') "
+    {
+        ip xfrm state 2>/dev/null | grep -oE '^src [0-9.]+ dst [0-9.]+' | awk '{ print $2; print $4 }'
+        if command -v wg >/dev/null 2>&1; then
+            wg show all endpoints 2>/dev/null | awk '{ sub(/:[0-9]+$/, "", $3); print $3 }'
+        fi
+    } | while read -r a; do
+        if is_ip4 "$a" && [[ $locals != *" $a "* ]]; then printf '%s\n' "$a"; fi
+    done | sort -u
+}
+
 yesno() { if "$@"; then echo yes; else echo no; fi; }
 
 cmd_status() {
@@ -563,6 +803,9 @@ cmd_status() {
     if ns_exists; then
         echo "--- interfaces in $NS"; ip -n "$NS" -br addr
         echo "--- routes in $NS";     ip -n "$NS" route
+        if [ "$(link_kind "$NS" "$TUNNEL")" = wireguard ] && command -v wg >/dev/null 2>&1; then
+            echo "--- WireGuard";     ip netns exec "$NS" wg show "$TUNNEL"
+        fi
         echo "--- processes in $NS"
         local p
         for p in $(ns_pids); do ps -o pid=,user=,args= -p "$p" 2>/dev/null || true; done
@@ -600,7 +843,13 @@ main() {
         set-mode) take_lock; cmd_set_mode "$@" ;;
         stop-apps) cmd_stop_apps ;;
         status)   cmd_status ;;
-        *) echo "usage: vpnks-helper {setup | teardown [--force] | attach | detach | status | stop-apps | set-mode netns|cgroup-split|cgroup-killswitch [--force] | dispatch IFACE ACTION | exec APP_ID [--env K=V]... -- COMMAND}" >&2
+        peers)    cmd_peers ;;
+        wg-import)    take_lock; cmd_wg_import "$@" ;;
+        wg-import-nm) take_lock; cmd_wg_import_nm "$@" ;;
+        wg-remove)    take_lock; cmd_wg_remove "$@" ;;
+        wg-up)        take_lock; cmd_wg_up "$@" ;;
+        wg-down)      take_lock; cmd_wg_down ;;
+        *) echo "usage: vpnks-helper {setup | teardown [--force] | attach | detach | status | peers | stop-apps | set-mode netns|cgroup-split|cgroup-killswitch [--force] | dispatch IFACE ACTION | exec APP_ID [--env K=V]... -- COMMAND | wg-import NAME < CONFIG | wg-import-nm UUID NAME | wg-remove NAME | wg-up NAME | wg-down}" >&2
            exit 2 ;;
     esac
 }

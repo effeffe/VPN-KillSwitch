@@ -1,4 +1,5 @@
 #include "SettingsDialog.h"
+#include "NetInfo.h"
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -33,8 +34,39 @@ SettingsDialog::SettingsDialog(GlobalConfig c, QWidget *parent) : QDialog(parent
     m_elev->setCurrentText(c.elevation);
     form->addRow(QStringLiteral("Privilege escalation (not used for firewalld)"), m_elev);
 
+    m_conn = new QComboBox(this);
+    m_conn->addItem(QStringLiteral("Any IPsec tunnel (interface prefix below)"));
+    {
+        QProcess p;
+        p.start(QStringLiteral("nmcli"), {QStringLiteral("-t"), QStringLiteral("-f"), QStringLiteral("NAME,UUID,TYPE"), QStringLiteral("connection"), QStringLiteral("show")});
+        if (p.waitForFinished(5000) && p.exitCode() == 0) {
+            for (const QString &l : QString::fromUtf8(p.readAllStandardOutput()).split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+                const QStringList f = NetInfo::splitTerse(l);
+                if (f.size() < 3 || (f[2] != QLatin1String("vpn") && f[2] != QLatin1String("wireguard"))) continue;
+                const bool wg = f[2] == QLatin1String("wireguard");
+                m_conn->addItem(f[0] + (wg ? QStringLiteral(" (WireGuard)") : QStringLiteral(" (IPsec)")), QStringList{f[1], f[0], f[2]});
+            }
+        }
+    }
+    if (!c.fullTunnelUuid.isEmpty()) {
+        int i = 1;
+        while (i < m_conn->count() && m_conn->itemData(i).toStringList().value(0) != c.fullTunnelUuid) ++i;
+        if (i == m_conn->count())   // no longer in NetworkManager: keep it selectable
+            m_conn->addItem(c.fullTunnelName + QStringLiteral(" (missing)"),
+                            QStringList{c.fullTunnelUuid, c.fullTunnelName, c.wireguardTunnel() ? QStringLiteral("wireguard") : QStringLiteral("vpn"), c.fullTunnelIface});
+        m_conn->setCurrentIndex(i);
+    }
+    m_conn->setToolTip(QStringLiteral("The connection that serves as full tunnel for the killswitch and the per-app killswitch.\n"
+                                      "IPsec (strongSwan): its nm-xfrm interface; WireGuard: its interface name.\n"
+                                      "The VPN server it connects to is allowed automatically while it is up."));
+    form->addRow(QStringLiteral("Full-tunnel connection"), m_conn);
+
     m_tunnel = new QLineEdit(c.tunnelPrefix, this);
-    form->addRow(QStringLiteral("Full-tunnel interface prefix"), m_tunnel);
+    form->addRow(QStringLiteral("IPsec tunnel interface prefix"), m_tunnel);
+    connect(m_conn, &QComboBox::currentIndexChanged, this, [this](int) {
+        m_tunnel->setEnabled(m_conn->currentData().toStringList().value(2) != QLatin1String("wireguard"));
+    });
+    m_tunnel->setEnabled(!c.wireguardTunnel());
     m_phys = new QLineEdit(c.physIf, this);
     m_phys->setPlaceholderText(QStringLiteral("empty = auto: every `ip route show default` device (re-armed when it changes)"));
     form->addRow(QStringLiteral("Uplink interface(s)"), m_phys);
@@ -75,6 +107,21 @@ GlobalConfig SettingsDialog::config() const
     c.backend = m_backend->currentText();
     c.elevation = m_elev->currentText();
     c.tunnelPrefix = m_tunnel->text().trimmed();
+    const QStringList conn = m_conn->currentData().toStringList();   // uuid, name, type[, iface]
+    if (!conn.isEmpty()) {
+        c.fullTunnelUuid = conn.value(0);
+        c.fullTunnelName = conn.value(1);
+        if (conn.value(2) == QLatin1String("wireguard")) {
+            c.fullTunnelIface = conn.value(3);
+            QProcess p;
+            p.start(QStringLiteral("nmcli"), {QStringLiteral("-g"), QStringLiteral("connection.interface-name"), QStringLiteral("connection"),
+                                              QStringLiteral("show"), QStringLiteral("uuid"), c.fullTunnelUuid});
+            if (p.waitForFinished(5000) && p.exitCode() == 0) {
+                const QString iface = QString::fromUtf8(p.readAllStandardOutput()).trimmed();
+                if (!iface.isEmpty()) c.fullTunnelIface = iface;
+            }
+        }
+    }
     c.physIf = m_phys->text().trimmed();
     c.lan = csv(m_lan->text());
     c.endpoints = csv(m_eps->text());

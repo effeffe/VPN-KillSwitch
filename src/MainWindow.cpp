@@ -7,6 +7,10 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -20,6 +24,7 @@
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSignalBlocker>
 #include <QSplitter>
 #include <QStatusBar>
@@ -45,22 +50,6 @@ static QIcon makeIcon(bool armed, bool tunnelUp, bool nsAttached)
         p.setBrush(QColor(0x1f, 0x6f, 0xeb)); p.drawEllipse(21, 21, 9, 9);
     }
     return QIcon(px);
-}
-
-// nmcli -t output: fields separated by ':', with ':' and '\' inside values backslash-escaped
-static QStringList splitTerse(const QString &line)
-{
-    QStringList out;
-    QString cur;
-    bool esc = false;
-    for (const QChar ch : line) {
-        if (esc) { cur += ch; esc = false; }
-        else if (ch == QLatin1Char('\\')) esc = true;
-        else if (ch == QLatin1Char(':')) { out << cur; cur.clear(); }
-        else cur += ch;
-    }
-    out << cur;
-    return out;
 }
 
 MainWindow::MainWindow(Killswitch &ks, Namespace &ns, bool startHidden, QWidget *parent)
@@ -107,13 +96,26 @@ MainWindow::MainWindow(Killswitch &ks, Namespace &ns, bool startHidden, QWidget 
     m_nsLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     auto *nsRow = new QHBoxLayout;
     auto *profileBtn = new QPushButton(QStringLiteral("Create split profile…"), nsBox);
-    profileBtn->setToolTip(QStringLiteral("Copies a NetworkManager VPN connection so that, when connected, its tunnel serves only the namespace."));
+    profileBtn->setToolTip(QStringLiteral("Copies a NetworkManager VPN connection so that, when connected, its tunnel serves only the namespace,\n"
+                                          "or imports a WireGuard connection / .conf file that vpnks connects into the namespace itself."));
     m_setupBtn = new QPushButton(QStringLiteral("Set up namespace"), nsBox);
     m_teardownBtn = new QPushButton(QStringLiteral("Tear down"), nsBox);
     connect(profileBtn, &QPushButton::clicked, this, &MainWindow::createSplitProfile);
     connect(m_setupBtn, &QPushButton::clicked, this, &MainWindow::nsSetup);
     connect(m_teardownBtn, &QPushButton::clicked, this, &MainWindow::nsTeardown);
     nsRow->addWidget(profileBtn); nsRow->addWidget(m_setupBtn); nsRow->addWidget(m_teardownBtn); nsRow->addStretch();
+
+    m_wgRow = new QWidget(nsBox);
+    auto *wgLay = new QHBoxLayout(m_wgRow);
+    wgLay->setContentsMargins(0, 0, 0, 0);
+    m_wgCombo = new QComboBox(m_wgRow);
+    m_wgBtn = new QPushButton(QStringLiteral("Connect"), m_wgRow);
+    m_wgRemoveBtn = new QPushButton(QStringLiteral("Remove"), m_wgRow);
+    m_wgBtn->setToolTip(QStringLiteral("Brings the WireGuard tunnel up inside the namespace (not shown in the NetworkManager applet)"));
+    connect(m_wgBtn, &QPushButton::clicked, this, &MainWindow::wgToggle);
+    connect(m_wgRemoveBtn, &QPushButton::clicked, this, &MainWindow::wgRemoveProfile);
+    wgLay->addWidget(new QLabel(QStringLiteral("WireGuard:"), m_wgRow));
+    wgLay->addWidget(m_wgCombo); wgLay->addWidget(m_wgBtn); wgLay->addWidget(m_wgRemoveBtn); wgLay->addStretch();
 
     m_table = new QTableWidget(0, ColCount, nsBox);
     m_table->setHorizontalHeaderLabels({QStringLiteral("App"), QStringLiteral("Command"), QStringLiteral("In namespace")});
@@ -141,6 +143,7 @@ MainWindow::MainWindow(Killswitch &ks, Namespace &ns, bool startHidden, QWidget 
     nsLay->addLayout(methodRow);
     nsLay->addWidget(m_nsLabel);
     nsLay->addLayout(nsRow);
+    nsLay->addWidget(m_wgRow);
     nsLay->addWidget(m_table);
     nsLay->addLayout(appRow);
 
@@ -195,9 +198,12 @@ void MainWindow::showArmed(bool armed)
 
 void MainWindow::toggleArmed(bool on)
 {
-    if (on && m_ks.config.endpoints.isEmpty()) {
-        if (QMessageBox::question(this, QStringLiteral("No VPN endpoint configured"),
-                QStringLiteral("Without an allowed endpoint the tunnel cannot re-establish once armed. Arm anyway?")) != QMessageBox::Yes) { showArmed(m_armed); return; }
+    if (on) m_ks.updatePeers();
+    if (on && m_ks.config.endpoints.isEmpty() && m_ks.peers().isEmpty()) {
+        if (QMessageBox::question(this, QStringLiteral("No VPN endpoint"),
+                QStringLiteral("The full tunnel (%1) is not up and no endpoint is configured in Settings, so no VPN server is allowed: "
+                               "the tunnel cannot be established once armed (vpnks adds the server when it comes up only if it is "
+                               "already connected, or listed in Settings). Arm anyway?").arg(m_ks.config.tunnelLabel())) != QMessageBox::Yes) { showArmed(m_armed); return; }
     }
     QString err;
     const bool ok = on ? m_ks.arm(&err) : m_ks.disarm(&err);
@@ -229,6 +235,8 @@ void MainWindow::openSettings()
     m_ks.config = d.config();
     m_ks.config.save();
     m_ks.reload();
+    m_ks.updatePeers();
+    m_lastDev = m_ks.config.tunnelDevice();
     if (wasArmed) { QString err; if (!m_ks.arm(&err)) QMessageBox::warning(this, QStringLiteral("Re-arm"), err); }
     refresh();
 }
@@ -241,20 +249,32 @@ void MainWindow::createSplitProfile()
         QMessageBox::warning(this, QStringLiteral("nmcli"), QStringLiteral("Could not list NetworkManager connections:\n%1").arg(QString::fromUtf8(p.readAllStandardError())));
         return;
     }
-    QStringList vpnNames, vpnUuids, allNames;
+    QStringList vpnNames, vpnUuids, allNames, wgNames, wgUuids;
     const QStringList lines = QString::fromUtf8(p.readAllStandardOutput()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
     for (const QString &line : lines) {
-        const QStringList f = splitTerse(line);
+        const QStringList f = NetInfo::splitTerse(line);
         if (f.size() < 3) continue;
         allNames << f[0];
         if (f[2] == QLatin1String("vpn")) { vpnNames << f[0]; vpnUuids << f[1]; }
+        else if (f[2] == QLatin1String("wireguard")) { wgNames << f[0]; wgUuids << f[1]; }
     }
-    if (vpnNames.isEmpty()) { QMessageBox::information(this, QStringLiteral("Create split profile"), QStringLiteral("No VPN connections found in NetworkManager.")); return; }
+    // WireGuard is not copied in NetworkManager: vpnks imports it and connects it into the namespace itself
+    const QString wgSuffix = QStringLiteral(" (WireGuard)");
+    const QString wgFile = QStringLiteral("WireGuard .conf file…");
+    QStringList items = vpnNames;
+    for (const QString &n : std::as_const(wgNames)) items << n + wgSuffix;
+    items << wgFile;
 
     bool ok = false;
-    const QString pick = QInputDialog::getItem(this, QStringLiteral("Create split profile"), QStringLiteral("Copy which VPN connection?"), vpnNames, 0, false, &ok);
+    const QString pick = QInputDialog::getItem(this, QStringLiteral("Create split profile"), QStringLiteral("Copy or import which VPN connection?"), items, 0, false, &ok);
     if (!ok) return;
+    if (pick == wgFile) { importWireGuard(QString(), QString()); return; }
     const int idx = vpnNames.indexOf(pick);
+    if (idx < 0) {
+        const int w = items.indexOf(pick) - vpnNames.size();
+        if (w >= 0 && w < wgNames.size()) importWireGuard(wgUuids[w], wgNames[w]);
+        return;
+    }
     const QString newName = QInputDialog::getText(this, QStringLiteral("Create split profile"), QStringLiteral("Name of the split-tunnel copy:"),
                                                   QLineEdit::Normal, pick + QStringLiteral(" (split)"), &ok).trimmed();
     if (!ok || newName.isEmpty()) return;
@@ -268,11 +288,87 @@ void MainWindow::createSplitProfile()
                              QStringLiteral("ipv6.never-default"), QStringLiteral("yes")}, false);
     }
     if (!r.ok()) { QMessageBox::warning(this, QStringLiteral("nmcli"), r.err.isEmpty() ? QStringLiteral("nmcli failed") : r.err); return; }
+    r = m_ks.runner.run({QStringLiteral("nmcli"), QStringLiteral("-g"), QStringLiteral("connection.uuid"), QStringLiteral("connection"), QStringLiteral("show"),
+                         QStringLiteral("id"), newName}, false);
+    if (r.ok() && !r.out.trimmed().isEmpty()) { m_splitUuid = r.out.trimmed(); m_splitName = newName; }
     QMessageBox::information(this, QStringLiteral("Split profile created"),
         QStringLiteral("“%1” is a copy of “%2” whose tunnel (%3) is handed to the VPN namespace.\n\n"
                        "Connect “%1” from the NetworkManager applet for split tunnelling: your system keeps its normal "
                        "connection and only apps launched from vpnks use the VPN.\nConnect “%2” as before for a full tunnel.")
             .arg(newName, pick, m_ns.cfg.tunnel));
+}
+
+void MainWindow::importWireGuard(const QString &nmUuid, const QString &suggestedName)
+{
+    const QString title = QStringLiteral("Import WireGuard");
+    QByteArray conf;
+    QString suggested = suggestedName;
+    if (nmUuid.isEmpty()) {
+        const QString path = QFileDialog::getOpenFileName(this, title, QDir::homePath(), QStringLiteral("WireGuard config (*.conf);;All files (*)"));
+        if (path.isEmpty()) return;
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) { QMessageBox::warning(this, title, QStringLiteral("Cannot read %1:\n%2").arg(path, f.errorString())); return; }
+        conf = f.read(65537);
+        if (conf.size() > 65536) { QMessageBox::warning(this, title, QStringLiteral("%1 is too large for a WireGuard config.").arg(path)); return; }
+        suggested = QFileInfo(path).completeBaseName();
+    }
+    suggested.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_-]+")), QStringLiteral("-"));
+    suggested = suggested.left(32);
+
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, title, QStringLiteral("Profile name (letters, digits, _ and -):"), QLineEdit::Normal, suggested, &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    if (!Namespace::isWgName(name)) { QMessageBox::warning(this, title, QStringLiteral("“%1” is not a valid profile name.").arg(name)); return; }
+    if (m_ns.wgProfiles().contains(name)
+        && QMessageBox::question(this, title, QStringLiteral("A WireGuard profile “%1” exists. Replace it?").arg(name)) != QMessageBox::Yes) return;
+
+    QString err;
+    if (!(nmUuid.isEmpty() ? m_ns.wgImport(name, conf, &err) : m_ns.wgImportNm(nmUuid, name, &err))) {
+        QMessageBox::warning(this, title, err);
+        return;
+    }
+    m_wgImported = name;
+    rebuildWgProfiles();
+    m_wgCombo->setCurrentText(name);
+    if (QMessageBox::question(this, title,
+            QStringLiteral("WireGuard profile “%1” imported. vpnks connects it into the namespace itself — it does not appear in the "
+                           "NetworkManager applet, and the original connection stays usable as a full tunnel.\n\nConnect it now?").arg(name)) == QMessageBox::Yes)
+        wgToggle();
+}
+
+void MainWindow::rebuildWgProfiles()
+{
+    const QString cur = m_wgCombo->currentText();
+    QSignalBlocker b(m_wgCombo);
+    m_wgCombo->clear();
+    m_wgCombo->addItems(m_ns.wgProfiles());
+    if (!cur.isEmpty()) m_wgCombo->setCurrentText(cur);
+    m_wgRow->setVisible(m_wgCombo->count() > 0);
+}
+
+void MainWindow::wgToggle()
+{
+    QString err;
+    if (m_nsState.tunnelType == QLatin1String("wireguard")) {
+        if (!m_ns.wgDown(&err)) QMessageBox::warning(this, QStringLiteral("WireGuard"), err);
+    } else {
+        const QString name = m_wgCombo->currentText();
+        if (name.isEmpty()) return;
+        if (!m_ns.wgUp(name, &err)) QMessageBox::warning(this, QStringLiteral("WireGuard"), err);
+    }
+    refresh();
+}
+
+void MainWindow::wgRemoveProfile()
+{
+    const QString name = m_wgCombo->currentText();
+    if (name.isEmpty()) return;
+    if (QMessageBox::question(this, QStringLiteral("WireGuard"), QStringLiteral("Delete the WireGuard profile “%1” from vpnks? "
+            "The connection or file it was imported from is not touched.").arg(name)) != QMessageBox::Yes) return;
+    QString err;
+    if (!m_ns.wgRemove(name, &err)) { QMessageBox::warning(this, QStringLiteral("WireGuard"), err); return; }
+    if (m_wgImported == name) m_wgImported.clear();
+    rebuildWgProfiles();
 }
 
 void MainWindow::changeMethod(int index)
@@ -327,10 +423,23 @@ void MainWindow::nsTeardown()
     for (int n : std::as_const(m_counts)) running += n;
     QString q = QStringLiteral("Remove the VPN namespace and its host-only link?");
     if (running > 0) q += QStringLiteral("\n\n%1 process(es) still run inside and will be stopped.").arg(running);
-    if (m_nsState.tunnelAttached) q += QStringLiteral("\n\nThe split VPN stays connected in NetworkManager but loses its interface — disconnect it too.");
+    if (!m_splitUuid.isEmpty()) q += QStringLiteral("\n\nThe split profile “%1” is disconnected and deleted from NetworkManager.").arg(m_splitName);
+    else if (m_nsState.tunnelAttached && m_nsState.tunnelType != QLatin1String("wireguard"))
+        q += QStringLiteral("\n\nThe split VPN stays connected in NetworkManager but loses its interface — disconnect it too.");
+    if (!m_wgImported.isEmpty()) q += QStringLiteral("\n\nThe WireGuard profile “%1” imported this session is disconnected and deleted from vpnks.").arg(m_wgImported);
     if (QMessageBox::question(this, QStringLiteral("Tear down"), q) != QMessageBox::Yes) return;
     QString err;
     if (!m_ns.teardown(running > 0, &err)) QMessageBox::warning(this, QStringLiteral("VPN namespace"), err);
+    if (!m_splitUuid.isEmpty()) {
+        const CmdResult r = m_ks.runner.run({QStringLiteral("nmcli"), QStringLiteral("connection"), QStringLiteral("delete"), QStringLiteral("uuid"), m_splitUuid}, false);
+        if (r.ok()) { m_splitUuid.clear(); m_splitName.clear(); }
+        else QMessageBox::warning(this, QStringLiteral("nmcli"), QStringLiteral("Could not delete the split profile “%1”:\n%2").arg(m_splitName, r.err));
+    }
+    if (!m_wgImported.isEmpty()) {   // the namespace is gone, and with it the WireGuard interface
+        if (m_ns.wgRemove(m_wgImported, &err)) m_wgImported.clear();
+        else QMessageBox::warning(this, QStringLiteral("WireGuard"), QStringLiteral("Could not delete the WireGuard profile “%1”:\n%2").arg(m_wgImported, err));
+        rebuildWgProfiles();
+    }
     refreshLive();
 }
 
@@ -372,7 +481,7 @@ void MainWindow::updateNsStatus()
                     .arg(s.connectionId.isEmpty() ? QString() : QStringLiteral(" (“%1”)").arg(s.connectionId.toHtmlEscaped()),
                          s.vip.toHtmlEscaped(), s.dns.toHtmlEscaped(), m_ns.cfg.nsIp());
         } else {
-            t = QStringLiteral("<b>No tunnel</b> — connect a split profile (interface <code>%1</code>) from the NetworkManager applet. "
+            t = QStringLiteral("<b>No tunnel</b> — connect a split profile (interface <code>%1</code>) from the NetworkManager applet, or a WireGuard profile below. "
                                "Apps in the namespace stay offline until then.").arg(m_ns.cfg.tunnel);
         }
     } else if (mode == Namespace::Mode::CgroupSplit) {
@@ -382,13 +491,16 @@ void MainWindow::updateNsStatus()
                     .arg(s.connectionId.isEmpty() ? QString() : QStringLiteral(" (“%1”)").arg(s.connectionId.toHtmlEscaped()),
                          m_ns.cfg.slice, s.vip.toHtmlEscaped(), s.dns.toHtmlEscaped());
         } else {
-            t = QStringLiteral("<b>No split tunnel</b> — connect a split profile (interface <code>%1</code>) from the NetworkManager applet. "
+            t = QStringLiteral("<b>No split tunnel</b> — connect a split profile (interface <code>%1</code>) from the NetworkManager applet, or a WireGuard profile below. "
                                "Until then apps below can only leave through a full tunnel, if one is up, and are blocked otherwise.").arg(m_ns.cfg.tunnel);
         }
     } else {
+        const QStringList peers = m_ks.peers();
         t = QStringLiteral("<b>Per-app killswitch</b> — apps below run in <code>%1</code> and may only leave through the full tunnel "
-                           "(<code>%2*</code>), LAN and localhost. Use your normal profile. Full tunnel: <b>%3</b>.")
-                .arg(m_ns.cfg.slice, m_ks.config.tunnelPrefix.toHtmlEscaped(), m_lastDev.isEmpty() ? QStringLiteral("down — apps are blocked") : QStringLiteral("up"));
+                           "<code>%2</code> (choose it in Settings), LAN and localhost. Full tunnel: <b>%3</b>.")
+                .arg(m_ns.cfg.slice, m_ks.config.tunnelLabel().toHtmlEscaped(),
+                     m_lastDev.isEmpty() ? QStringLiteral("down — apps are blocked")
+                                         : QStringLiteral("up (%1), VPN server %2").arg(m_lastDev, peers.isEmpty() ? QStringLiteral("not detected yet") : peers.join(QStringLiteral(", "))));
     }
     if (s.helperInstalled && mode != Namespace::Mode::Netns) {
         if (!m_rulesWarn.isEmpty()) t += QStringLiteral("<br><span style='color:#b35900'>%1</span>").arg(m_rulesWarn.toHtmlEscaped());
@@ -401,6 +513,12 @@ void MainWindow::updateNsStatus()
     const bool usesNs = mode != Namespace::Mode::CgroupKillswitch;
     m_setupBtn->setEnabled(s.helperInstalled && usesNs);
     m_teardownBtn->setEnabled(s.helperInstalled && s.nsPresent && usesNs);
+    const bool wgUp = s.tunnelAttached && s.tunnelType == QLatin1String("wireguard");
+    m_wgBtn->setText(wgUp ? QStringLiteral("Disconnect") : QStringLiteral("Connect"));
+    // another tunnel (a connected split profile) already owns the namespace's interface
+    m_wgBtn->setEnabled(s.helperInstalled && usesNs && (wgUp || !s.tunnelAttached));
+    m_wgCombo->setEnabled(!wgUp);
+    m_wgRemoveBtn->setEnabled(s.helperInstalled && !(wgUp && s.connectionId.startsWith(m_wgCombo->currentText() + QLatin1Char(' '))));
 }
 
 void MainWindow::refreshRules()
@@ -423,7 +541,14 @@ void MainWindow::refresh()
         m_methodCombo->setCurrentIndex(m_methodCombo->findData(int(m_ns.mode())));
     }
     showArmed(m_ks.isArmed());
+    m_lastDev = m_ks.config.tunnelDevice();
+    m_peerTries = 0;
+    if (m_ks.updatePeers() && m_armed) {
+        m_log->appendPlainText(QStringLiteral("VPN peers changed -> re-arming"));
+        QString err; if (!m_ks.arm(&err)) m_log->appendPlainText(QStringLiteral("warning: re-arm failed: ") + err);
+    }
     rebuildTable();
+    rebuildWgProfiles();
     m_nsState = m_ns.state();
     refreshRules();
     refreshLive();
@@ -431,18 +556,27 @@ void MainWindow::refresh()
 
 void MainWindow::refreshLive()
 {
-    const QString dev = NetInfo::tunnelDevice(m_ks.config.tunnelPrefix);
+    const QString dev = m_ks.config.tunnelDevice();
     const bool up = !dev.isEmpty();
-    if (dev != m_lastDev) { m_lastDev = dev; if (up && m_armed) m_ks.tunnelChanged(dev); }
+    bool peersDue = false, rearm = false, rules = false;
+    if (dev != m_lastDev) { m_lastDev = dev; if (up && m_armed) m_ks.tunnelChanged(dev); m_peerTries = 0; peersDue = true; }
+    // a new tunnel's SAs / peers can show up a moment after its interface: retry a few times
+    if (up && m_peerTries < 5 && (m_ks.peers().isEmpty() || m_peerTries > 0)) peersDue = true;
+    if (peersDue) {
+        ++m_peerTries;
+        if (m_ks.updatePeers()) { rearm = m_armed; rules = true; m_peerTries = 5; }
+    }
     const QStringList ul = m_ks.uplinks();
     if (ul != m_lastUplinks) {
         const bool first = m_lastUplinks.isEmpty() && !m_armed;
         m_lastUplinks = ul;
-        if (m_armed && !first && m_ks.config.physIf.trimmed().isEmpty()) {
-            m_log->appendPlainText(QStringLiteral("uplinks changed -> re-arming"));
-            QString err; if (!m_ks.arm(&err) && m_tray) m_tray->showMessage(QStringLiteral("Re-arm failed"), err);
-        }
+        if (!first && m_ks.config.physIf.trimmed().isEmpty()) { rearm = rearm || m_armed; rules = true; }
     }
+    if (rearm) {
+        m_log->appendPlainText(QStringLiteral("VPN peers or uplinks changed -> re-arming"));
+        QString err; if (!m_ks.arm(&err) && m_tray) m_tray->showMessage(QStringLiteral("Re-arm failed"), err);
+    }
+    if (rules && m_ns.isCgroup()) refreshRules();
     m_nsState = m_ns.state();
     m_counts = m_ns.runningCounts();
     updateRows();

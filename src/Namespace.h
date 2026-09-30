@@ -10,14 +10,16 @@
 struct NsState {
     bool helperInstalled = false;   // /usr/lib/vpnks/vpnks-helper present
     bool nsPresent = false;         // /run/netns/<ns> exists
-    bool tunnelAttached = false;    // the split profile's XFRM interface is inside the namespace
+    bool tunnelAttached = false;    // the split profile's XFRM interface (or WireGuard) is inside the namespace
+    QString tunnelType;             // rtnetlink kind of the attached tunnel: xfrm | wireguard
     bool cgroupRouting = false;     // cgroup split: marked traffic is routed into the namespace
     QString vip, dns, connectionId;
 };
 
 // Per-app VPN. The split profile's XFRM interface is moved into the network namespace by the
-// NetworkManager dispatcher hook on vpn-up. Apps then either run inside that namespace
-// (Mode::Netns), or in the system slice vpnks.slice where firewall rules match them by
+// NetworkManager dispatcher hook on vpn-up; a WireGuard profile is brought up by the helper
+// itself (wg-up), created in the root namespace and moved in the same way. Apps then either run
+// inside that namespace (Mode::Netns), or in the system slice vpnks.slice where firewall rules match them by
 // cgroup: CgroupSplit marks their traffic and the helper routes it through the namespace into
 // the tunnel; CgroupKillswitch only lets them out through the full tunnel.
 // Root work happens in /usr/lib/vpnks/vpnks-helper (via pkexec); firewall rules come from the
@@ -43,8 +45,18 @@ public:
     bool setMode(Mode m, bool force, QString *err) const;   // helper set-mode (routing, slice, config)
     bool stopApps(QString *err) const;
 
+    // WireGuard split tunnels: profiles in /etc/vpnks/wg (names world-readable, contents root-only)
+    static QString wgDir() { return QStringLiteral("/etc/vpnks/wg"); }
+    static bool isWgName(const QString &name);
+    QStringList wgProfiles() const;
+    bool wgImport(const QString &name, const QByteArray &conf, QString *err) const;   // wg-quick .conf
+    bool wgImportNm(const QString &uuid, const QString &name, QString *err) const;    // NetworkManager connection
+    bool wgRemove(const QString &name, QString *err) const;
+    bool wgUp(const QString &name, QString *err) const;
+    bool wgDown(QString *err) const;
+
     // Firewall rules for the cgroup methods, fingerprinted with every setting they depend on.
-    AppRuleSpec ruleSpec(const GlobalConfig &c) const;
+    AppRuleSpec ruleSpec(const Killswitch &ks) const;
     // Makes sure the rules match ruleSpec(). With apps still running under older rules those are
     // kept (they still confine the apps) and *warn says so. False = do not launch.
     bool ensureAppRules(Killswitch &ks, QString *err, QString *warn = nullptr) const;
@@ -62,6 +74,6 @@ public:
 
     static QStringList sessionEnvArgs();   // whitelisted session environment as --env KEY=VALUE
 private:
-    bool helper(const QStringList &args, QString *err) const;
+    bool helper(const QStringList &args, QString *err, const QByteArray &stdinData = {}) const;
     const Runner &m_r;
 };

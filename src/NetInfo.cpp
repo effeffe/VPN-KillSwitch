@@ -31,4 +31,20 @@ QString tunnelDevice(const QString &prefix)
     return devs.isEmpty() ? QString() : devs.first();
 }
 
+// nmcli -t output: fields separated by ':', with ':' and '\\' inside values backslash-escaped
+QStringList splitTerse(const QString &line)
+{
+    QStringList out;
+    QString cur;
+    bool esc = false;
+    for (const QChar ch : line) {
+        if (esc) { cur += ch; esc = false; }
+        else if (ch == QLatin1Char('\\')) esc = true;
+        else if (ch == QLatin1Char(':')) { out << cur; cur.clear(); }
+        else cur += ch;
+    }
+    out << cur;
+    return out;
+}
+
 }

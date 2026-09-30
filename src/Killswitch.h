@@ -24,8 +24,14 @@ public:
     QString appRulesTag() { return m_b->appRulesTag(); }
 
     void tunnelChanged(const QString &dev) { if (m_b) m_b->tunnelChanged(dev); }
-    QStringList resolvedEndpoints(QString *err = nullptr) const;
+    QStringList resolvedEndpoints(QString *err = nullptr) const;   // configured endpoints + live peers
+    // Re-reads the live IPsec/WireGuard peers (vpnks-helper peers) while the full tunnel is up;
+    // the last known set is kept (and remembered across restarts) while it is down. True when
+    // they changed, i.e. the armed killswitch and the cgroup rules need updating.
+    bool updatePeers();
+    QStringList peers() const { return m_peers; }
     QStringList uplinks() const { return config.uplinks(); }
 private:
     std::unique_ptr<Backend> m_b;
+    QStringList m_peers;
 };

@@ -13,7 +13,8 @@ optdepends=('qt6-wayland: Wayland support'
             'firewalld: killswitch backend'
             'nftables: killswitch backend'
             'iptables: killswitch backend'
-            'ufw: killswitch backend')
+            'ufw: killswitch backend'
+            'wireguard-tools: WireGuard split tunnels')
 provides=("${_pkgname}")
 conflicts=("${_pkgname}")
 backup=('etc/vpnks/helper.conf')

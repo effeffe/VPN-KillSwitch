@@ -1,6 +1,7 @@
 # vpnks — VPN killswitch + per-app VPN (Qt6)
 
-For a NetworkManager-managed strongSwan (IKEv2) VPN. Two independent features:
+For a NetworkManager-managed strongSwan (IKEv2) VPN, or WireGuard (split tunnel managed by vpnks,
+see [WireGuard](#wireguard)). Two independent features:
 
 - **Full-tunnel killswitch.** Arm once and the rules stay until you disarm, whatever the tunnel does.
   Backends: firewalld, iptables, nftables, ufw.
@@ -51,6 +52,28 @@ sudo usermod -aG vpnks $USER
    **Add to app menu** creates an "<App> (VPN)" launcher (`vpnks --launch <id>`).
 
 The table shows how many processes of each app are running under the current method.
+
+### WireGuard
+
+**Create split profile…** also lists NetworkManager WireGuard connections and a
+*WireGuard .conf file…* entry (wg-quick format). Either is imported into
+`/etc/vpnks/wg/<name>.conf` (root-only, mode 0600); a **WireGuard:** row then offers
+**Connect** / **Disconnect** / **Remove**. Needs `wireguard-tools` (`wg`).
+
+- vpnks, not NetworkManager, brings the tunnel up (`vpnks-helper wg-up <name>`), so it does not
+  appear in the applet. NetworkManager owns the WireGuard interfaces it creates and would mark the
+  connection failed once the interface left its namespace.
+- The interface is created as `vpnks0` in the root namespace and then moved into the namespace:
+  WireGuard keeps its UDP socket in the namespace it was created in, so the encrypted packets use
+  the normal connection while the plaintext side serves only the namespace. All three per-app
+  methods work unchanged on top of it.
+- Only `PrivateKey`, `ListenPort`, `Address`, `DNS`, `MTU` and the peer keys are kept on import;
+  `PostUp`/`PreDown`/`Table`/… are dropped and never run. Only IPv4 addresses and DNS servers are
+  used. Endpoint host names are resolved when connecting.
+- Importing from NetworkManager needs the private key stored in the connection (the default); a
+  key held by a secret agent cannot be read, import the .conf file instead.
+- Only one tunnel at a time: disconnect a connected "(split)" profile before connecting WireGuard,
+  and vice versa. With the full-tunnel killswitch armed, add the WireGuard server to its endpoints.
 
 ### Per-app method
 
@@ -178,15 +201,28 @@ Policy installed by every backend (same semantics, backend-native syntax):
 
     accept -> loopback / local addresses
     accept -> LAN CIDRs (+ the namespace host-only link if the helper is installed)
-    accept -> VPN endpoint IPs (hostnames resolved at arm time), only on the uplink(s)
+    accept -> VPN servers, only on the uplink(s): the live peers of the full tunnel
+              + configured endpoint IPs (hostnames resolved at arm time)
     accept -> optional DNS servers on :53
-    accept -> anything leaving via <full-tunnel prefix>*   (nm-xfrm+ / "nm-xfrm*")
+    accept -> anything leaving via the full tunnel (IPsec: nm-xfrm+ / "nm-xfrm*"; WireGuard: its interface)
     REJECT everything else          (IPv6: reject all unless "block IPv6" is off)
 
 Rules are tagged `vpnks:global` so disarm removes exactly what was installed.
 
-Setup: Settings… → backend (the one that actually manages your firewall), endpoints (or
-"Import from NM…" to pull `address=` from the strongSwan connection), LAN. Uplink interface(s):
+**Full-tunnel connection** (Settings): the NetworkManager connection that serves as full tunnel,
+for the killswitch and for the per-app *killswitch only* method — an IPsec (strongSwan) or a
+WireGuard connection. It sets the tunnel interface (IPsec: `nm-xfrm*`; WireGuard: the connection's
+`interface-name`). While it is up, vpnks reads the VPN servers it is actually connected to
+(`vpnks-helper peers`: `ip xfrm state` and `wg show all endpoints`) and allows them, re-arming when
+they change (a reconnect, another server behind the same hostname). This matters for the per-app
+rules too: the encrypted packets of an IPsec tunnel still carry the socket of the app that sent
+the plaintext, so without the server allowed they hit the cgroup REJECT. Rules are replaced
+without a gap (firewalld: add, then remove the stale ones; iptables: new chain, then swap;
+nftables: one atomic transaction). vpnks has to run (the tray is enough) to follow a reconnect.
+
+Setup: Settings… → backend (the one that actually manages your firewall), full-tunnel connection,
+optionally fixed endpoints (or "Import from NM…" to pull `address=` from the strongSwan connection),
+needed only to arm before the tunnel is up, LAN. Uplink interface(s):
 leave empty to use every device with a default route (`ip route show default`, v4+v6, tunnel
 excluded); vpnks re-arms automatically when that set changes. Autostart: `vpnks --hidden`.
 

@@ -21,6 +21,8 @@ private slots:
     void changeMethod(int index);
     void nsSetup();
     void nsTeardown();
+    void wgToggle();
+    void wgRemoveProfile();
     void addApp();
     void removeApp();
     void launchSelected();
@@ -38,6 +40,8 @@ private:
     void launchApp(const AppEntry &a);
     void setupTray();
     void bringToFront();
+    void importWireGuard(const QString &nmUuid, const QString &suggestedName);
+    void rebuildWgProfiles();
 
     Killswitch &m_ks;
     Namespace &m_ns;
@@ -48,6 +52,9 @@ private:
     bool m_armed = false;
     QString m_lastDev;
     QStringList m_lastUplinks;
+    int m_peerTries = 0;
+    QString m_splitUuid, m_splitName;   // split profile created this session; deleted on tear down
+    QString m_wgImported;               // WireGuard profile imported this session; removed on tear down
 
     QPushButton *m_armBtn = nullptr;
     QLabel *m_armLabel = nullptr;
@@ -56,6 +63,10 @@ private:
     QComboBox *m_methodCombo = nullptr;
     QPushButton *m_setupBtn = nullptr;
     QPushButton *m_teardownBtn = nullptr;
+    QWidget *m_wgRow = nullptr;
+    QComboBox *m_wgCombo = nullptr;
+    QPushButton *m_wgBtn = nullptr;
+    QPushButton *m_wgRemoveBtn = nullptr;
     QTableWidget *m_table = nullptr;
     QPlainTextEdit *m_log = nullptr;
     QSystemTrayIcon *m_tray = nullptr;

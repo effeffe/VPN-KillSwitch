@@ -8,6 +8,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTextStream>
 #include <sys/stat.h>
@@ -27,6 +28,7 @@ NsState Namespace::state() const
             if (eq > 0) kv.insert(QString::fromUtf8(line.left(eq)), QString::fromUtf8(line.mid(eq + 1)));
         }
         s.tunnelAttached = kv.value(QStringLiteral("tunnel")) == QLatin1String("attached");
+        s.tunnelType = kv.value(QStringLiteral("tunnel_type"));
         s.vip = kv.value(QStringLiteral("vip"));
         s.dns = kv.value(QStringLiteral("dns"));
         s.connectionId = kv.value(QStringLiteral("connection_id"));
@@ -71,17 +73,27 @@ bool Namespace::setMode(Mode m, bool force, QString *err) const
 
 bool Namespace::stopApps(QString *err) const { return helper({QStringLiteral("stop-apps")}, err); }
 
-AppRuleSpec Namespace::ruleSpec(const GlobalConfig &c) const
+static QString fingerprint(const QStringList &parts)
 {
+    return QString::fromLatin1(QCryptographicHash::hash(parts.join(QLatin1Char('|')).toUtf8(), QCryptographicHash::Sha1).toHex().left(8));
+}
+
+AppRuleSpec Namespace::ruleSpec(const Killswitch &ks) const
+{
+    const GlobalConfig &c = ks.config;
     AppRuleSpec s;
     s.cgroupPath = cfg.slice;
     s.split = mode() == Mode::CgroupSplit;
     s.mark = cfg.mark;
     s.hostIf = cfg.hostIf;
-    const QStringList parts{s.cgroupPath, s.split ? QStringLiteral("split") : QStringLiteral("killswitch"), s.mark, s.hostIf,
-                            c.allowedCidrs().join(QLatin1Char(',')), c.tunnelPrefix, c.blockIpv6 ? QStringLiteral("v6off") : QStringLiteral("v6on")};
-    const QByteArray h = QCryptographicHash::hash(parts.join(QLatin1Char('|')).toUtf8(), QCryptographicHash::Sha1).toHex().left(8);
-    s.tag = QStringLiteral("vpnks:apps:") + QString::fromLatin1(h);
+    s.endpoints = ks.resolvedEndpoints();
+    s.uplinks = ks.uplinks();
+    // "<base>-<dynamic>": the dynamic half follows the full tunnel (peers, uplinks, interface) and
+    // may be updated while apps run; a different base means the confinement itself changed
+    const QString base = fingerprint({s.cgroupPath, s.split ? QStringLiteral("split") : QStringLiteral("killswitch"), s.mark, s.hostIf,
+                                      c.allowedCidrs().join(QLatin1Char(',')), c.blockIpv6 ? QStringLiteral("v6off") : QStringLiteral("v6on")});
+    const QString dyn = fingerprint({c.tunnelIpt(), s.endpoints.join(QLatin1Char(',')), s.uplinks.join(QLatin1Char(','))});
+    s.tag = QStringLiteral("vpnks:apps:%1-%2").arg(base, dyn);
     return s;
 }
 
@@ -107,10 +119,12 @@ bool Namespace::ensureAppRules(Killswitch &ks, QString *err, QString *warn) cons
                                        "or switch the per-app method to the network namespace.").arg(ks.backendName());
         return false;
     }
-    const AppRuleSpec spec = ruleSpec(ks.config);
+    const AppRuleSpec spec = ruleSpec(ks);
     const QString have = ks.appRulesTag();
     if (have == spec.tag) return true;
-    if (!have.isEmpty() && sliceProcessCount() > 0) {
+    const bool sameBase = have.section(QLatin1Char('-'), 0, 0) == spec.tag.section(QLatin1Char('-'), 0, 0);
+    // backends replace the set without a gap, so only a change of the confinement itself waits for the apps
+    if (!have.isEmpty() && !sameBase && sliceProcessCount() > 0) {
         if (warn) *warn = QStringLiteral("The firewall rules for VPN apps predate your current settings; quit the running VPN apps so vpnks can update them.");
         return true;   // the old rules still confine the running apps
     }
@@ -118,9 +132,9 @@ bool Namespace::ensureAppRules(Killswitch &ks, QString *err, QString *warn) cons
     return ks.applyAppRules(spec, err);
 }
 
-bool Namespace::helper(const QStringList &args, QString *err) const
+bool Namespace::helper(const QStringList &args, QString *err, const QByteArray &stdinData) const
 {
-    const CmdResult r = m_r.run(QStringList{QStringLiteral("pkexec"), helperPath()} + args, false);
+    const CmdResult r = m_r.run(QStringList{QStringLiteral("pkexec"), helperPath()} + args, false, stdinData);
     if (!r.ok() && err) *err = r.err.isEmpty() ? QStringLiteral("helper exited with status %1").arg(r.exit) : r.err;
     return r.ok();
 }
@@ -133,6 +147,37 @@ bool Namespace::teardown(bool force, QString *err) const
     if (force) a << QStringLiteral("--force");
     return helper(a, err);
 }
+
+bool Namespace::isWgName(const QString &name)
+{
+    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9_-]{1,32}$"));
+    return re.match(name).hasMatch();
+}
+
+QStringList Namespace::wgProfiles() const
+{
+    QStringList out;
+    const QStringList files = QDir(wgDir()).entryList({QStringLiteral("*.conf")}, QDir::Files, QDir::Name);
+    for (const QString &f : files) {
+        const QString name = f.chopped(5);
+        if (isWgName(name)) out << name;
+    }
+    return out;
+}
+
+bool Namespace::wgImport(const QString &name, const QByteArray &conf, QString *err) const
+{
+    return helper({QStringLiteral("wg-import"), name}, err, conf);
+}
+
+bool Namespace::wgImportNm(const QString &uuid, const QString &name, QString *err) const
+{
+    return helper({QStringLiteral("wg-import-nm"), uuid, name}, err);
+}
+
+bool Namespace::wgRemove(const QString &name, QString *err) const { return helper({QStringLiteral("wg-remove"), name}, err); }
+bool Namespace::wgUp(const QString &name, QString *err) const { return helper({QStringLiteral("wg-up"), name}, err); }
+bool Namespace::wgDown(QString *err) const { return helper({QStringLiteral("wg-down")}, err); }
 
 QStringList Namespace::sessionEnvArgs()
 {

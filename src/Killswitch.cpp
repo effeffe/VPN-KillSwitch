@@ -1,8 +1,15 @@
 #include "Killswitch.h"
 #include <QHostAddress>
+#include <QFileInfo>
 #include <QHostInfo>
+#include <QSettings>
 
-Killswitch::Killswitch() { config.load(); reload(); }
+Killswitch::Killswitch()
+{
+    config.load();
+    reload();
+    m_peers = QSettings().value(QStringLiteral("lastPeers")).toStringList();
+}
 
 void Killswitch::reload()
 {
@@ -24,8 +31,29 @@ QStringList Killswitch::resolvedEndpoints(QString *err) const
             if (x.protocol() == QAbstractSocket::IPv4Protocol) { out << x.toString(); any = true; }
         if (!any && err) *err += QStringLiteral("could not resolve %1\n").arg(h);
     }
+    out += m_peers;
     out.removeDuplicates();
     return out;
+}
+
+bool Killswitch::updatePeers()
+{
+    // Only ever replaced by a live, non-empty set: while the tunnel is down (or its SAs are not up
+    // yet) the last servers stay allowed, so an armed killswitch still lets it reconnect.
+    static const QString helper = QStringLiteral("/usr/lib/vpnks/vpnks-helper");
+    if (config.tunnelDevice().isEmpty() || !QFileInfo(helper).isExecutable()) return false;
+    const CmdResult r = runner.run({QStringLiteral("pkexec"), helper, QStringLiteral("peers")}, false);
+    QStringList now;
+    for (const QString &l : r.out.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const QHostAddress a(l.trimmed());
+        if (a.protocol() == QAbstractSocket::IPv4Protocol) now << a.toString();
+    }
+    now.sort();
+    if (now.isEmpty() || now == m_peers) return false;
+    m_peers = now;
+    QSettings().setValue(QStringLiteral("lastPeers"), m_peers);
+    if (runner.logger) runner.logger(QStringLiteral("# VPN peers: %1").arg(now.join(QLatin1Char(' '))));
+    return true;
 }
 
 bool Killswitch::arm(QString *err)

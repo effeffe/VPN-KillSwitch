@@ -9,12 +9,16 @@ struct AppRuleSpec {
     bool split = false;   // also mark the traffic and NAT it onto the namespace link
     QString mark;         // fwmark the helper's policy routing looks for
     QString hostIf;       // host side of the namespace link
-    QString tag;          // rule comment "vpnks:apps:<fingerprint of spec + settings>"
+    QStringList endpoints;// VPN servers (configured + live peers): the encrypted packets of an IPsec
+                          // tunnel still carry the app's socket, so they match the cgroup too
+    QStringList uplinks;  // restrict those to the uplinks; empty = any interface
+    QString tag;          // rule comment "vpnks:apps:<base fingerprint>-<dynamic fingerprint>"
 };
 
 // One implementation per firewall. All produce the same policy:
 //   accept local -> accept LAN -> accept VPN endpoints -> accept tunnel -> REJECT
-// and tag every rule so disarm can find them regardless of current settings.
+// and tag every rule so disarm can find them regardless of current settings. Re-arming and
+// replacing the app rules never leave a moment without them (the peers change on reconnect).
 class Backend {
 public:
     Backend(const Runner &r, const GlobalConfig &c) : m_r(r), m_c(c) {}

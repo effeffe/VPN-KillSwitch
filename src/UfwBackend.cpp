@@ -1,5 +1,4 @@
 #include "UfwBackend.h"
-#include "NetInfo.h"
 #include <QRegularExpression>
 
 const QString UfwBackend::kTag = QStringLiteral("vpnks-global");
@@ -23,7 +22,7 @@ bool UfwBackend::arm(const QStringList &eps, const QStringList &up, QString *err
         for (const QString &u : up) allow({QStringLiteral("on"), u, QStringLiteral("to"), e});
     }
     for (const QString &d : m_c.dns) allow({QStringLiteral("to"), d, QStringLiteral("port"), QStringLiteral("53")});
-    ok = allowTunnel(NetInfo::tunnelDevice(m_c.tunnelPrefix), err) && ok;
+    ok = allowTunnel(m_c.tunnelDevice(), err) && ok;
     CmdResult r = ufw({QStringLiteral("default"), QStringLiteral("deny"), QStringLiteral("outgoing")});
     if (!r.ok()) { ok = false; if (err) *err = r.err; }
     return ok;

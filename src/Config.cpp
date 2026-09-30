@@ -1,4 +1,5 @@
 #include "Config.h"
+#include <QFileInfo>
 #include <QSettings>
 #include "HelperConfig.h"
 #include "NetInfo.h"
@@ -21,12 +22,29 @@ void GlobalConfig::load()
     endpoints    = clean(s.value(QStringLiteral("endpoints"), endpoints).toStringList());
     dns          = clean(s.value(QStringLiteral("dns"), dns).toStringList());
     blockIpv6    = s.value(QStringLiteral("blockIpv6"), blockIpv6).toBool();
+    fullTunnelUuid  = s.value(QStringLiteral("fullTunnelUuid")).toString();
+    fullTunnelName  = s.value(QStringLiteral("fullTunnelName")).toString();
+    fullTunnelIface = s.value(QStringLiteral("fullTunnelIface")).toString();
+}
+
+QString GlobalConfig::tunnelDevice() const
+{
+    if (wireguardTunnel()) return QFileInfo::exists(QStringLiteral("/sys/class/net/") + fullTunnelIface) ? fullTunnelIface : QString();
+    return NetInfo::tunnelDevice(tunnelPrefix);
+}
+
+QString GlobalConfig::tunnelLabel() const
+{
+    const QString dev = wireguardTunnel() ? fullTunnelIface : tunnelNft();
+    return fullTunnelName.isEmpty() ? dev : QStringLiteral("%1 (%2)").arg(fullTunnelName, dev);
 }
 
 QStringList GlobalConfig::uplinks() const
 {
     if (!physIf.trimmed().isEmpty()) return clean(physIf.split(QLatin1Char(',')));
-    return NetInfo::defaultRouteDevices(tunnelPrefix);
+    QStringList devs = NetInfo::defaultRouteDevices(tunnelPrefix);
+    if (wireguardTunnel()) devs.removeAll(fullTunnelIface);
+    return devs;
 }
 
 QStringList GlobalConfig::allowedCidrs() const
@@ -57,4 +75,7 @@ void GlobalConfig::save() const
     s.setValue(QStringLiteral("endpoints"), endpoints);
     s.setValue(QStringLiteral("dns"), dns);
     s.setValue(QStringLiteral("blockIpv6"), blockIpv6);
+    s.setValue(QStringLiteral("fullTunnelUuid"), fullTunnelUuid);
+    s.setValue(QStringLiteral("fullTunnelName"), fullTunnelName);
+    s.setValue(QStringLiteral("fullTunnelIface"), fullTunnelIface);
 }

@@ -84,6 +84,11 @@ bool NftBackend::applyAppRules(const AppRuleSpec &s, QString *err)
     x += C + QStringLiteral("oifname \"lo\" accept") + T;
     x += C + QStringLiteral("fib daddr type local accept") + T;
     if (!allowed.isEmpty()) x += C + QStringLiteral("ip daddr ") + set(allowed) + QStringLiteral(" accept") + T;
+    if (!s.endpoints.isEmpty()) {
+        QString oif;
+        if (!s.uplinks.isEmpty()) { QStringList q; for (const QString &u : s.uplinks) q << QStringLiteral("\"%1\"").arg(u); oif = QStringLiteral("oifname ") + set(q) + QLatin1Char(' '); }
+        x += C + oif + QStringLiteral("ip daddr ") + set(s.endpoints) + QStringLiteral(" accept") + T;
+    }
     x += C + (m_c.blockIpv6 ? QStringLiteral("meta nfproto ipv4 ") : QString()) + tunnelMatch() + QStringLiteral(" accept") + T;
     if (s.split) x += C + QStringLiteral("meta nfproto ipv4 oifname \"%1\" accept").arg(s.hostIf) + T;
     x += C + QStringLiteral("reject with icmpx type admin-prohibited") + T;

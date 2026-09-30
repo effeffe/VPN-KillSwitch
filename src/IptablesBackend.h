@@ -18,7 +18,8 @@ public:
     QString appRulesTag() override;
 private:
     CmdResult ipt(const QString &bin, const QStringList &args) const { return m_r.run(QStringList{bin} + args); }
-    bool ensureChain(const QString &bin, const QString &table, const QString &hook, const QString &chain, QString *err) const;
     bool dropChain(const QString &bin, const QString &table, const QString &hook, const QString &chain) const;
+    bool replaceChain(const QString &bin, const QString &table, const QString &hook, const QString &chain,
+                      const QList<QStringList> &body, QString *err) const;
     QList<QStringList> globalBody(const QString &bin, const QStringList &eps, const QStringList &up) const;
 };

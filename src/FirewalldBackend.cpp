@@ -31,13 +31,28 @@ QList<QStringList> FirewalldBackend::globalRules(const QStringList &eps, const Q
     return R;
 }
 
-bool FirewalldBackend::add(const QList<QStringList> &rules, QString *err) const
+bool FirewalldBackend::sync(const QList<QStringList> &rules, const QString &tag, QString *err) const
 {
+    // add what is missing before removing what is stale, so the set is never absent
+    QStringList want;
+    for (const QStringList &r : rules) want << r.join(QLatin1Char(' '));
     bool ok = true;
-    for (const QStringList &r : rules) {
-        CmdResult a = fw(QStringList{QStringLiteral("--direct"), QStringLiteral("--add-rule")} + r);
-        CmdResult b = fw(QStringList{QStringLiteral("--permanent"), QStringLiteral("--direct"), QStringLiteral("--add-rule")} + r);
-        if (!a.ok() || !b.ok()) { ok = false; if (err) *err = a.ok() ? b.err : a.err; }
+    for (const QStringList &scope : {QStringList{}, QStringList{QStringLiteral("--permanent")}}) {
+        const CmdResult cur = fw(scope + QStringList{QStringLiteral("--direct"), QStringLiteral("--get-all-rules")});
+        if (!cur.ok() && !m_r.dryRun) { ok = false; if (err) *err = cur.err; continue; }
+        QStringList have;
+        for (const QString &l : cur.out.split(QLatin1Char('\n'), Qt::SkipEmptyParts))
+            if (l.contains(tag)) have << l.simplified();
+        for (int i = 0; i < rules.size(); ++i) {
+            if (have.contains(want[i])) continue;
+            const CmdResult a = fw(scope + QStringList{QStringLiteral("--direct"), QStringLiteral("--add-rule")} + rules[i]);
+            if (!a.ok()) { ok = false; if (err) *err = a.err; }
+        }
+        for (const QString &l : std::as_const(have)) {
+            if (want.contains(l)) continue;
+            const CmdResult d = fw(scope + QStringList{QStringLiteral("--direct"), QStringLiteral("--remove-rule")} + l.split(QLatin1Char(' ')));
+            if (!d.ok()) { ok = false; if (err) *err = d.err; }
+        }
     }
     return ok;
 }
@@ -77,8 +92,7 @@ void FirewalldBackend::removeLegacyAppRules() const
 bool FirewalldBackend::arm(const QStringList &eps, const QStringList &up, QString *err)
 {
     removeLegacyAppRules();
-    removeTagged(QString::fromLatin1(kGlobalTag), nullptr); // idempotent re-arm
-    return add(globalRules(eps, up), err);
+    return sync(globalRules(eps, up), QString::fromLatin1(kGlobalTag), err);
 }
 bool FirewalldBackend::disarm(QString *err)
 {
@@ -101,6 +115,10 @@ QList<QStringList> FirewalldBackend::appRules(const AppRuleSpec &s) const
     f(v4, 4, {QStringLiteral("-o"), QStringLiteral("lo"), QStringLiteral("-j"), A});
     f(v4, 4, {QStringLiteral("-m"), QStringLiteral("addrtype"), QStringLiteral("--dst-type"), QStringLiteral("LOCAL"), QStringLiteral("-j"), A});
     for (const QString &l : m_c.allowedCidrs()) f(v4, 4, {QStringLiteral("-d"), l, QStringLiteral("-j"), A});
+    for (const QString &e : s.endpoints) {
+        if (s.uplinks.isEmpty()) f(v4, 4, {QStringLiteral("-d"), e, QStringLiteral("-j"), A});
+        for (const QString &u : s.uplinks) f(v4, 4, {QStringLiteral("-o"), u, QStringLiteral("-d"), e, QStringLiteral("-j"), A});
+    }
     f(v4, 4, {QStringLiteral("-o"), m_c.tunnelIpt(), QStringLiteral("-j"), A});
     if (s.split) f(v4, 4, {QStringLiteral("-o"), s.hostIf, QStringLiteral("-j"), A});
     f(v4, 5, {QStringLiteral("-j"), QStringLiteral("REJECT")});
@@ -119,8 +137,7 @@ QList<QStringList> FirewalldBackend::appRules(const AppRuleSpec &s) const
 
 bool FirewalldBackend::applyAppRules(const AppRuleSpec &s, QString *err)
 {
-    removeTagged(QLatin1String(kAppsTag), nullptr);
-    return add(appRules(s), err);
+    return sync(appRules(s), QString::fromLatin1(kAppsTag), err);
 }
 
 bool FirewalldBackend::removeAppRules(QString *err) { return removeTagged(QLatin1String(kAppsTag), err); }

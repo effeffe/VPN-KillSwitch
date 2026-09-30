@@ -12,6 +12,7 @@ static int cli(const QStringList &args, Killswitch &ks, Namespace &ns)
     QTextStream out(stdout);
     ks.runner.logger = [&](const QString &s) { out << s << '\n'; out.flush(); };
     QString err;
+    ks.updatePeers();   // the live VPN peers go into the killswitch and cgroup rules
     if (args.contains(QStringLiteral("--launch"))) {
         const QString id = args.value(args.indexOf(QStringLiteral("--launch")) + 1);
         AppStore store;
@@ -35,7 +36,7 @@ static int cli(const QStringList &args, Killswitch &ks, Namespace &ns)
             << "namespace: " << (s.nsPresent ? "present" : "absent")
             << (s.tunnelAttached ? QStringLiteral(", tunnel attached (vip %1, dns %2)").arg(s.vip, s.dns) : QStringLiteral(", no tunnel")) << '\n';
         if (ns.isCgroup()) {
-            const QString have = ks.appRulesTag(), want = ns.ruleSpec(ks.config).tag;
+            const QString have = ks.appRulesTag(), want = ns.ruleSpec(ks).tag;
             out << "cgroup rules: " << (have.isEmpty() ? QStringLiteral("not loaded") : have == want ? have : have + QStringLiteral(" (outdated, want ") + want + ')')
                 << "\nprocesses in " << ns.cfg.slice << ": " << ns.sliceProcessCount() << '\n';
         }
