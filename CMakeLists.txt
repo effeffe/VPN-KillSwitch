@@ -24,10 +24,9 @@ add_executable(vpnks
 target_link_libraries(vpnks PRIVATE Qt6::Widgets Qt6::Network)
 target_compile_options(vpnks PRIVATE -Wall -Wextra)
 
-install(TARGETS vpnks RUNTIME DESTINATION bin)
-install(FILES dist/vpnks.desktop DESTINATION share/applications)
-install(FILES dist/vpnks.svg DESTINATION share/icons/hicolor/scalable/apps)
-# System integration: fixed paths, referenced by the polkit action and the GUI.
+install(TARGETS vpnks RUNTIME DESTINATION /usr/bin)
+install(FILES dist/vpnks.desktop DESTINATION /usr/share/applications)
+install(FILES dist/vpnks.svg DESTINATION /usr/share/icons/hicolor/scalable/apps)
 install(PROGRAMS dist/vpnks-helper DESTINATION /usr/lib/vpnks)
 install(PROGRAMS dist/90-vpnks DESTINATION /etc/NetworkManager/dispatcher.d)
 install(FILES dist/helper.conf DESTINATION /etc/vpnks)
